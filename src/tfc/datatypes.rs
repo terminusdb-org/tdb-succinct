@@ -85,7 +85,7 @@ impl Datatype {
             Datatype::BigInt => None,
             Datatype::Token => None,
             Datatype::LangString => None,
-            Datatype::DateTimeInterval => Some(48),
+            Datatype::DateTimeInterval => None,
             _ => None,
         }
     }
