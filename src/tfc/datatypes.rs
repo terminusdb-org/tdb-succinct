@@ -7,7 +7,7 @@ use super::{
 use base64::display::Base64Display;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use chrono::{NaiveDateTime, NaiveTime};
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use num_derive::FromPrimitive;
 use rug::Integer;
 
@@ -85,6 +85,7 @@ impl Datatype {
             Datatype::BigInt => None,
             Datatype::Token => None,
             Datatype::LangString => None,
+            Datatype::DateTimeInterval => Some(48),
             _ => None,
         }
     }
@@ -1117,6 +1118,49 @@ impl FromLexical<DateTimeInterval> for DateTimeInterval {
     }
 }
 
+fn interval_component_to_iso(seconds: i64, nanos: u32) -> String {
+    let ndt = NaiveDateTime::from_timestamp_opt(seconds, nanos)
+        .unwrap_or_else(|| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap());
+    if ndt.time().hour() == 0 && ndt.time().minute() == 0
+        && ndt.time().second() == 0 && ndt.time().nanosecond() == 0
+    {
+        ndt.format("%Y-%m-%d").to_string()
+    } else {
+        ndt.format("%Y-%m-%dT%H:%M:%S%.fZ").to_string()
+    }
+}
+
+fn interval_duration_to_iso(duration: &Duration) -> String {
+    let s = duration_string(duration);
+    if duration.sign < 0 {
+        format!("-{s}")
+    } else {
+        s
+    }
+}
+
+impl FromLexical<DateTimeInterval> for String {
+    fn from_lexical<B: Buf>(b: B) -> String {
+        let iv = DateTimeInterval::from_lexical(b);
+        let dur_str = interval_duration_to_iso(&iv.duration);
+        match iv.flag {
+            INTERVAL_FLAG_START_DURATION => {
+                let start = interval_component_to_iso(iv.start_seconds, iv.start_nanos);
+                format!("{start}/{dur_str}")
+            }
+            INTERVAL_FLAG_DURATION_END => {
+                let end = interval_component_to_iso(iv.end_seconds, iv.end_nanos);
+                format!("{dur_str}/{end}")
+            }
+            _ => {
+                let start = interval_component_to_iso(iv.start_seconds, iv.start_nanos);
+                let end = interval_component_to_iso(iv.end_seconds, iv.end_nanos);
+                format!("{start}/{end}")
+            }
+        }
+    }
+}
+
 macro_rules! stringy_type {
     ($ty:ident) => {
         stringy_type!($ty, $ty);
@@ -1487,6 +1531,98 @@ mod tests {
         assert_eq!(3000000, iv1.end_seconds);
         assert_eq!(2000000, iv2.start_seconds);
         assert_eq!(3000000, iv2.end_seconds);
+    }
+
+    #[test]
+    fn date_time_interval_iso_string_explicit_dates() {
+        let iv = make_interval(
+            1735689600, 0,   // 2025-01-01T00:00:00Z
+            1743465600, 0,   // 2025-04-01T00:00:00Z
+            INTERVAL_COMPONENT_DATE, INTERVAL_COMPONENT_DATE,
+            INTERVAL_FLAG_EXPLICIT,
+            make_duration(1, 0, 0, 90, 0, 0, 0.0),
+        );
+        let s = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
+        assert_eq!("2025-01-01/2025-04-01", s);
+    }
+
+    #[test]
+    fn date_time_interval_iso_string_explicit_datetimes_with_time() {
+        // 2025-01-01T10:30:00Z and 2025-04-01T15:45:00Z
+        let iv = make_interval(
+            1735727400, 0,   // 2025-01-01T10:30:00Z
+            1743522300, 0,   // 2025-04-01T15:45:00Z
+            INTERVAL_COMPONENT_DATETIME, INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_FLAG_EXPLICIT,
+            make_duration(1, 0, 0, 90, 5, 15, 0.0),
+        );
+        let s = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
+        assert_eq!("2025-01-01T10:30:00Z/2025-04-01T15:45:00Z", s);
+    }
+
+    #[test]
+    fn date_time_interval_iso_string_explicit_with_nanos() {
+        let iv = make_interval(
+            1735689600, 500_000_000,
+            1743465600, 0,
+            INTERVAL_COMPONENT_DATETIME, INTERVAL_COMPONENT_DATE,
+            INTERVAL_FLAG_EXPLICIT,
+            make_duration(1, 0, 0, 90, 0, 0, 0.0),
+        );
+        let s = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
+        assert_eq!("2025-01-01T00:00:00.500Z/2025-04-01", s);
+    }
+
+    #[test]
+    fn date_time_interval_iso_string_start_duration() {
+        let iv = make_interval(
+            1735689600, 0,
+            1743465600, 0,
+            INTERVAL_COMPONENT_DATE, INTERVAL_COMPONENT_DATE,
+            INTERVAL_FLAG_START_DURATION,
+            make_duration(1, 0, 3, 0, 0, 0, 0.0),
+        );
+        let s = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
+        assert_eq!("2025-01-01/P3M", s);
+    }
+
+    #[test]
+    fn date_time_interval_iso_string_duration_end() {
+        let iv = make_interval(
+            1735689600, 0,
+            1743465600, 0,
+            INTERVAL_COMPONENT_DATE, INTERVAL_COMPONENT_DATE,
+            INTERVAL_FLAG_DURATION_END,
+            make_duration(1, 0, 3, 0, 0, 0, 0.0),
+        );
+        let s = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
+        assert_eq!("P3M/2025-04-01", s);
+    }
+
+    #[test]
+    fn date_time_interval_iso_string_duration_with_time_parts() {
+        let iv = make_interval(
+            1735689600, 0,
+            1735693200, 0,   // 1 hour later
+            INTERVAL_COMPONENT_DATETIME, INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_FLAG_START_DURATION,
+            make_duration(1, 0, 0, 0, 1, 0, 0.0),
+        );
+        let s = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
+        assert_eq!("2025-01-01/PT1H", s);
+    }
+
+    #[test]
+    fn date_time_interval_iso_string_midnight_datetime_omits_time() {
+        let iv = make_interval(
+            1735689600, 0,   // 2025-01-01T00:00:00Z (midnight)
+            1743465600, 0,   // 2025-04-01T00:00:00Z (midnight)
+            INTERVAL_COMPONENT_DATETIME, INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_FLAG_EXPLICIT,
+            make_duration(1, 0, 0, 90, 0, 0, 0.0),
+        );
+        let s = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
+        assert_eq!("2025-01-01/2025-04-01", s);
     }
 
     #[test]
