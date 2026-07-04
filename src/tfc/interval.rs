@@ -1,4 +1,4 @@
-use chrono::{NaiveDate, NaiveDateTime};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use thiserror::Error;
 
 use super::datatypes::{
@@ -110,19 +110,24 @@ pub fn parse_iso_interval(s: &str) -> Result<DateTimeInterval, IntervalParseErro
     }
 }
 
-/// Parse a date (`YYYY-MM-DD`) or datetime (`YYYY-MM-DDTHH:MM:SS[.fff][Z]`) string.
-/// Returns (unix_seconds, nanos, component_type).
+/// Parse a date (`YYYY-MM-DD`) or datetime (`YYYY-MM-DDTHH:MM:SS[.fff][Z|+hh:mm|-hh:mm]`) string.
+/// Returns (unix_seconds, nanos, component_type). All datetimes are converted to UTC.
 /// When `is_end` is true and the component is a date, the date is bumped to the
 /// next calendar day, matching the half-open interval convention for unqualified
 /// ISO 8601 end dates.
 fn parse_date_or_datetime(s: &str, is_end: bool) -> Result<(i64, u32, u8), IntervalParseError> {
     if s.contains('T') {
-        // DateTime
-        let s_trimmed = s.trim_end_matches('Z');
-        let ndt = NaiveDateTime::parse_from_str(s_trimmed, "%Y-%m-%dT%H:%M:%S%.f")
-            .or_else(|_| NaiveDateTime::parse_from_str(s_trimmed, "%Y-%m-%dT%H:%M:%S"))
+        // DateTime: try RFC 3339 first (Z or numeric offsets), then fall back to a
+        // naive datetime interpreted as UTC.
+        let dt = DateTime::parse_from_rfc3339(s)
+            .map(|dt| dt.with_timezone(&Utc))
+            .or_else(|_| {
+                NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
+                    .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"))
+                    .map(|ndt| ndt.and_utc())
+            })
             .map_err(|_| IntervalParseError::InvalidDateTime(s.to_string()))?;
-        Ok((ndt.and_utc().timestamp(), ndt.and_utc().timestamp_subsec_nanos(), INTERVAL_COMPONENT_DATETIME))
+        Ok((dt.timestamp(), dt.timestamp_subsec_nanos(), INTERVAL_COMPONENT_DATETIME))
     } else {
         // Date only
         let mut nd = NaiveDate::parse_from_str(s, "%Y-%m-%d")
@@ -135,7 +140,33 @@ fn parse_date_or_datetime(s: &str, is_end: bool) -> Result<(i64, u32, u8), Inter
     }
 }
 
+/// Designators in the ISO 8601 order used for duration parsing.
+/// The order is: Y < M < D < H < Minute < S.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum DurationDesignator {
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
+}
+
+/// Ensure `current` appears after the previous designator and is not a duplicate.
+fn validate_designator_order(
+    last: &Option<DurationDesignator>,
+    current: DurationDesignator,
+) -> Result<(), ()> {
+    if let Some(l) = last {
+        if *l >= current {
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
 /// Parse an ISO 8601 duration string like `P3M`, `P1Y2M3DT4H5M6S`, `-P1D`.
+/// Designators must appear in the order Y, M, D, T, H, M, S and may not be repeated.
 fn parse_iso_duration(s: &str) -> Result<Duration, IntervalParseError> {
     let err = || IntervalParseError::InvalidDuration(s.to_string());
 
@@ -159,17 +190,27 @@ fn parse_iso_duration(s: &str) -> Result<Duration, IntervalParseError> {
 
     if !date_part.is_empty() {
         let mut num_buf = String::new();
+        let mut last_designator: Option<DurationDesignator> = None;
         for ch in date_part.chars() {
             match ch {
                 'Y' => {
+                    let d = DurationDesignator::Year;
+                    validate_designator_order(&last_designator, d).map_err(|_| err())?;
+                    last_designator = Some(d);
                     year = num_buf.parse::<i64>().map_err(|_| err())?;
                     num_buf.clear();
                 }
                 'M' => {
+                    let d = DurationDesignator::Month;
+                    validate_designator_order(&last_designator, d).map_err(|_| err())?;
+                    last_designator = Some(d);
                     month = num_buf.parse::<u8>().map_err(|_| err())?;
                     num_buf.clear();
                 }
                 'D' => {
+                    let d = DurationDesignator::Day;
+                    validate_designator_order(&last_designator, d).map_err(|_| err())?;
+                    last_designator = Some(d);
                     day = num_buf.parse::<u8>().map_err(|_| err())?;
                     num_buf.clear();
                 }
@@ -191,17 +232,27 @@ fn parse_iso_duration(s: &str) -> Result<Duration, IntervalParseError> {
             return Err(err());
         }
         let mut num_buf = String::new();
+        let mut last_designator: Option<DurationDesignator> = None;
         for ch in tp.chars() {
             match ch {
                 'H' => {
+                    let d = DurationDesignator::Hour;
+                    validate_designator_order(&last_designator, d).map_err(|_| err())?;
+                    last_designator = Some(d);
                     hour = num_buf.parse::<u8>().map_err(|_| err())?;
                     num_buf.clear();
                 }
                 'M' => {
+                    let d = DurationDesignator::Minute;
+                    validate_designator_order(&last_designator, d).map_err(|_| err())?;
+                    last_designator = Some(d);
                     minute = num_buf.parse::<u8>().map_err(|_| err())?;
                     num_buf.clear();
                 }
                 'S' => {
+                    let d = DurationDesignator::Second;
+                    validate_designator_order(&last_designator, d).map_err(|_| err())?;
+                    last_designator = Some(d);
                     second = num_buf.parse::<f64>().map_err(|_| err())?;
                     num_buf.clear();
                 }
@@ -229,19 +280,25 @@ fn parse_iso_duration(s: &str) -> Result<Duration, IntervalParseError> {
 /// This produces a day-based duration (no month/year component).
 fn compute_duration_from_endpoints(
     start_seconds: i64,
-    _start_nanos: u32,
+    start_nanos: u32,
     end_seconds: i64,
-    _end_nanos: u32,
+    end_nanos: u32,
 ) -> Duration {
-    let diff = end_seconds - start_seconds;
-    let sign = if diff >= 0 { 1 } else { -1 };
-    let abs_diff = diff.unsigned_abs();
-    let days = (abs_diff / 86400) as u8;
-    let remainder = abs_diff % 86400;
-    let hours = (remainder / 3600) as u8;
-    let remainder = remainder % 3600;
-    let minutes = (remainder / 60) as u8;
-    let secs = (remainder % 60) as f64;
+    // Compute the full elapsed interval in nanoseconds so sub-second explicit
+    // intervals get a correct duration.
+    let total_nanos = (end_seconds as i128 - start_seconds as i128) * 1_000_000_000
+        + (end_nanos as i128 - start_nanos as i128);
+    let sign = if total_nanos >= 0 { 1 } else { -1 };
+    let abs_total_nanos = total_nanos.unsigned_abs();
+    let days = (abs_total_nanos / 86_400_000_000_000) as u8;
+    let remainder = abs_total_nanos % 86_400_000_000_000;
+    let hours = (remainder / 3_600_000_000_000) as u8;
+    let remainder = remainder % 3_600_000_000_000;
+    let minutes = (remainder / 60_000_000_000) as u8;
+    let remainder = remainder % 60_000_000_000;
+    let seconds = (remainder / 1_000_000_000) as u8;
+    let nanos = (remainder % 1_000_000_000) as u32;
+    let second = seconds as f64 + nanos as f64 / 1_000_000_000.0;
     Duration {
         sign,
         year: 0,
@@ -249,7 +306,7 @@ fn compute_duration_from_endpoints(
         day: days,
         hour: hours,
         minute: minutes,
-        second: secs,
+        second,
     }
 }
 
@@ -628,5 +685,49 @@ mod tests {
         let bytes = iv.to_lexical();
         let s = <String as FromLexical<DateTimeInterval>>::from_lexical(bytes);
         assert_eq!("2020-10-01T00:00:00Z/2021-01-01T00:00:00Z", s);
+    }
+
+    #[test]
+    fn parse_explicit_datetime_with_positive_offset() {
+        let iv = parse_iso_interval("2025-01-01T10:30:00+02:00/2025-04-01T15:45:00+02:00").unwrap();
+        assert_eq!(iv.start_seconds, 1735720200); // 2025-01-01T08:30:00Z
+        assert_eq!(iv.end_seconds, 1743515100); // 2025-04-01T13:45:00Z
+    }
+
+    #[test]
+    fn parse_explicit_datetime_with_negative_offset() {
+        let iv = parse_iso_interval("2025-01-01T10:30:00-05:00/2025-04-01T15:45:00-05:00").unwrap();
+        assert_eq!(iv.start_seconds, 1735745400); // 2025-01-01T15:30:00Z
+        assert_eq!(iv.end_seconds, 1743540300); // 2025-04-01T20:45:00Z
+    }
+
+    #[test]
+    fn parse_datetime_with_offset_roundtrips_to_utc() {
+        let iv = parse_iso_interval("2025-01-01T10:30:00+02:00/2025-04-01T15:45:00+02:00").unwrap();
+        let bytes = iv.to_lexical();
+        let s = <String as FromLexical<DateTimeInterval>>::from_lexical(bytes);
+        assert_eq!("2025-01-01T08:30:00Z/2025-04-01T13:45:00Z", s);
+    }
+
+    #[test]
+    fn compute_duration_from_sub_second_explicit_interval() {
+        let iv = parse_iso_interval("2025-01-01T00:00:00.000Z/2025-01-01T00:00:00.500Z").unwrap();
+        assert_eq!(iv.duration.second, 0.5);
+        assert_eq!(iv.duration.day, 0);
+        assert_eq!(iv.duration.hour, 0);
+        assert_eq!(iv.duration.minute, 0);
+    }
+
+    #[test]
+    fn parse_duplicate_duration_designator_is_error() {
+        // Duplicate designators are not valid ISO 8601.
+        assert!(parse_iso_interval("2025-01-01/P1M2M").is_err());
+    }
+
+    #[test]
+    fn parse_out_of_order_duration_designator_is_error() {
+        // ISO 8601 requires Y, M, D order before T and H, M, S order after T.
+        assert!(parse_iso_interval("2025-01-01/P1D1Y").is_err());
+        assert!(parse_iso_interval("2025-01-01/PT1S1H").is_err());
     }
 }
