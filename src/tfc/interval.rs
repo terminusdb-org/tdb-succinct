@@ -1,4 +1,4 @@
-use chrono::{NaiveDate, NaiveDateTime};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use thiserror::Error;
 
 use super::datatypes::{
@@ -114,12 +114,17 @@ pub fn parse_iso_interval(s: &str) -> Result<DateTimeInterval, IntervalParseErro
 /// Returns (unix_seconds, nanos, component_type).
 fn parse_date_or_datetime(s: &str) -> Result<(i64, u32, u8), IntervalParseError> {
     if s.contains('T') {
-        // DateTime
-        let s_trimmed = s.trim_end_matches('Z');
-        let ndt = NaiveDateTime::parse_from_str(s_trimmed, "%Y-%m-%dT%H:%M:%S%.f")
-            .or_else(|_| NaiveDateTime::parse_from_str(s_trimmed, "%Y-%m-%dT%H:%M:%S"))
+        // DateTime: try RFC 3339 first (handles Z and numeric offsets), then fall
+        // back to naive ISO 8601 datetimes which are interpreted as UTC.
+        let dt = DateTime::parse_from_rfc3339(s)
+            .map(|dt| dt.with_timezone(&Utc))
+            .or_else(|_| {
+                NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
+                    .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"))
+                    .map(|ndt| ndt.and_utc())
+            })
             .map_err(|_| IntervalParseError::InvalidDateTime(s.to_string()))?;
-        Ok((ndt.and_utc().timestamp(), ndt.and_utc().timestamp_subsec_nanos(), INTERVAL_COMPONENT_DATETIME))
+        Ok((dt.timestamp(), dt.timestamp_subsec_nanos(), INTERVAL_COMPONENT_DATETIME))
     } else {
         // Date only
         let nd = NaiveDate::parse_from_str(s, "%Y-%m-%d")
@@ -261,7 +266,8 @@ fn compute_end_from_start_and_duration(
     start_seconds: i64,
     start_nanos: u32,
 ) -> (i64, u32) {
-    let start_dt = NaiveDateTime::from_timestamp_opt(start_seconds, start_nanos)
+    let start_dt = DateTime::from_timestamp(start_seconds, start_nanos)
+        .map(|dt| dt.naive_utc())
         .unwrap_or_else(|| {
             NaiveDate::from_ymd_opt(1970, 1, 1)
                 .unwrap()
@@ -300,7 +306,8 @@ fn compute_start_from_duration_and_end(
     end_seconds: i64,
     end_nanos: u32,
 ) -> (i64, u32) {
-    let end_dt = NaiveDateTime::from_timestamp_opt(end_seconds, end_nanos)
+    let end_dt = DateTime::from_timestamp(end_seconds, end_nanos)
+        .map(|dt| dt.naive_utc())
         .unwrap_or_else(|| {
             NaiveDate::from_ymd_opt(1970, 1, 1)
                 .unwrap()
@@ -401,6 +408,26 @@ mod tests {
         let iv = parse_iso_interval("2025-01-01T00:00:00.500Z/2025-04-01T00:00:00Z").unwrap();
         assert_eq!(iv.start_nanos, 500_000_000);
         assert_eq!(iv.end_nanos, 0);
+    }
+
+    #[test]
+    fn parse_explicit_datetime_with_timezone_offset_and_nanos() {
+        // +02:00 means the local 09:00:00 is 07:00:00Z.
+        let s = "2025-01-01T09:00:00.000+02:00/2025-01-01T09:00:00.123456789+02:00";
+        let iv = parse_iso_interval(s).unwrap();
+        assert_eq!(iv.start_seconds, 1735689600 + 7 * 3600);
+        assert_eq!(iv.start_nanos, 0);
+        assert_eq!(iv.end_seconds, 1735689600 + 7 * 3600);
+        assert_eq!(iv.end_nanos, 123_456_789);
+        assert_eq!(iv.duration.second, 0.123456789);
+    }
+
+    #[test]
+    fn roundtrip_explicit_datetime_with_timezone_offset_and_nanos() {
+        let s = "2025-01-01T09:00:00.000+02:00/2025-01-01T09:00:00.123456789+02:00";
+        let iv = parse_iso_interval(s).unwrap();
+        let round = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
+        assert_eq!(round, "2025-01-01T07:00:00Z/2025-01-01T07:00:00.123456789Z");
     }
 
     #[test]
