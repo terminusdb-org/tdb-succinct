@@ -1121,10 +1121,8 @@ impl FromLexical<DateTimeInterval> for DateTimeInterval {
 fn interval_component_to_iso(seconds: i64, nanos: u32) -> String {
     let ndt = NaiveDateTime::from_timestamp_opt(seconds, nanos)
         .unwrap_or_else(|| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap());
-    if ndt.time().hour() == 0 && ndt.time().minute() == 0
-        && ndt.time().second() == 0 && ndt.time().nanosecond() == 0
-    {
-        ndt.format("%Y-%m-%d").to_string()
+    if nanos == 0 {
+        ndt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
     } else {
         ndt.format("%Y-%m-%dT%H:%M:%S%.fZ").to_string()
     }
@@ -1543,7 +1541,7 @@ mod tests {
             make_duration(1, 0, 0, 90, 0, 0, 0.0),
         );
         let s = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
-        assert_eq!("2025-01-01/2025-04-01", s);
+        assert_eq!("2025-01-01T00:00:00Z/2025-04-01T00:00:00Z", s);
     }
 
     #[test]
@@ -1570,7 +1568,7 @@ mod tests {
             make_duration(1, 0, 0, 90, 0, 0, 0.0),
         );
         let s = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
-        assert_eq!("2025-01-01T00:00:00.500Z/2025-04-01", s);
+        assert_eq!("2025-01-01T00:00:00.500Z/2025-04-01T00:00:00Z", s);
     }
 
     #[test]
@@ -1583,7 +1581,7 @@ mod tests {
             make_duration(1, 0, 3, 0, 0, 0, 0.0),
         );
         let s = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
-        assert_eq!("2025-01-01/P3M", s);
+        assert_eq!("2025-01-01T00:00:00Z/P3M", s);
     }
 
     #[test]
@@ -1596,7 +1594,7 @@ mod tests {
             make_duration(1, 0, 3, 0, 0, 0, 0.0),
         );
         let s = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
-        assert_eq!("P3M/2025-04-01", s);
+        assert_eq!("P3M/2025-04-01T00:00:00Z", s);
     }
 
     #[test]
@@ -1609,11 +1607,11 @@ mod tests {
             make_duration(1, 0, 0, 0, 1, 0, 0.0),
         );
         let s = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
-        assert_eq!("2025-01-01/PT1H", s);
+        assert_eq!("2025-01-01T00:00:00Z/PT1H", s);
     }
 
     #[test]
-    fn date_time_interval_iso_string_midnight_datetime_omits_time() {
+    fn date_time_interval_iso_string_midnight_datetime_renders_time() {
         let iv = make_interval(
             1735689600, 0,   // 2025-01-01T00:00:00Z (midnight)
             1743465600, 0,   // 2025-04-01T00:00:00Z (midnight)
@@ -1622,7 +1620,7 @@ mod tests {
             make_duration(1, 0, 0, 90, 0, 0, 0.0),
         );
         let s = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
-        assert_eq!("2025-01-01/2025-04-01", s);
+        assert_eq!("2025-01-01T00:00:00Z/2025-04-01T00:00:00Z", s);
     }
 
     #[test]
