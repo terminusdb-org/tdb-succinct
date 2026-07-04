@@ -832,7 +832,7 @@ mod tests {
 
     fn build_block_bytes(strings: &[&[u8]]) -> Bytes {
         let mut buf = BytesMut::new();
-        build_block_unchecked(None, &mut buf, &strings);
+        build_block_unchecked(None, &mut buf, strings);
 
         buf.freeze()
     }
