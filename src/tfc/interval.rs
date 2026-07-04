@@ -223,19 +223,26 @@ fn parse_iso_duration(s: &str) -> Result<Duration, IntervalParseError> {
 /// This produces a day-based duration (no month/year component).
 fn compute_duration_from_endpoints(
     start_seconds: i64,
-    _start_nanos: u32,
+    start_nanos: u32,
     end_seconds: i64,
-    _end_nanos: u32,
+    end_nanos: u32,
 ) -> Duration {
-    let diff = end_seconds - start_seconds;
-    let sign = if diff >= 0 { 1 } else { -1 };
-    let abs_diff = diff.unsigned_abs();
-    let days = (abs_diff / 86400) as u8;
-    let remainder = abs_diff % 86400;
-    let hours = (remainder / 3600) as u8;
-    let remainder = remainder % 3600;
-    let minutes = (remainder / 60) as u8;
-    let secs = (remainder % 60) as f64;
+    // Compute the full elapsed interval in nanoseconds so sub-second explicit
+    // intervals get a correct duration.
+    let start_total_nanos = start_seconds as i128 * 1_000_000_000 + start_nanos as i128;
+    let end_total_nanos = end_seconds as i128 * 1_000_000_000 + end_nanos as i128;
+    let total_nanos = end_total_nanos - start_total_nanos;
+    let sign = if total_nanos >= 0 { 1 } else { -1 };
+    let abs_total_nanos = total_nanos.unsigned_abs();
+    let days = (abs_total_nanos / 86_400_000_000_000) as u8;
+    let remainder = abs_total_nanos % 86_400_000_000_000;
+    let hours = (remainder / 3_600_000_000_000) as u8;
+    let remainder = remainder % 3_600_000_000_000;
+    let minutes = (remainder / 60_000_000_000) as u8;
+    let remainder = remainder % 60_000_000_000;
+    let secs = (remainder / 1_000_000_000) as u8;
+    let nanos = (remainder % 1_000_000_000) as u32;
+    let second = secs as f64 + nanos as f64 / 1_000_000_000.0;
     Duration {
         sign,
         year: 0,
@@ -243,7 +250,7 @@ fn compute_duration_from_endpoints(
         day: days,
         hour: hours,
         minute: minutes,
-        second: secs,
+        second,
     }
 }
 
@@ -469,7 +476,7 @@ mod tests {
         let iv = parse_iso_interval("2025-01-01/2025-04-01").unwrap();
         let bytes = iv.to_lexical();
         let s = <String as FromLexical<DateTimeInterval>>::from_lexical(bytes);
-        assert_eq!("2025-01-01/2025-04-01", s);
+        assert_eq!("2025-01-01T00:00:00Z/2025-04-01T00:00:00Z", s);
     }
 
     #[test]
@@ -477,7 +484,7 @@ mod tests {
         let iv = parse_iso_interval("2025-01-01/P3M").unwrap();
         let bytes = iv.to_lexical();
         let s = <String as FromLexical<DateTimeInterval>>::from_lexical(bytes);
-        assert_eq!("2025-01-01/P3M", s);
+        assert_eq!("2025-01-01T00:00:00Z/P3M", s);
     }
 
     #[test]
@@ -485,7 +492,7 @@ mod tests {
         let iv = parse_iso_interval("P3M/2025-04-01").unwrap();
         let bytes = iv.to_lexical();
         let s = <String as FromLexical<DateTimeInterval>>::from_lexical(bytes);
-        assert_eq!("P3M/2025-04-01", s);
+        assert_eq!("P3M/2025-04-01T00:00:00Z", s);
     }
 
     #[test]
