@@ -7,7 +7,7 @@ use super::{
 use base64::display::Base64Display;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime};
 use num_derive::FromPrimitive;
 use rug::Integer;
 
@@ -1119,7 +1119,8 @@ impl FromLexical<DateTimeInterval> for DateTimeInterval {
 }
 
 fn interval_component_to_iso(seconds: i64, nanos: u32) -> String {
-    let ndt = NaiveDateTime::from_timestamp_opt(seconds, nanos)
+    let ndt = DateTime::from_timestamp(seconds, nanos)
+        .map(|dt| dt.naive_utc())
         .unwrap_or_else(|| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap());
     // Always render as a fully qualified xsd:dateTime, even at midnight.
     ndt.format("%Y-%m-%dT%H:%M:%S%.fZ").to_string()

@@ -211,7 +211,7 @@ impl SizedDictEntry {
         v
     }
 
-    pub fn as_buf(&self) -> SizedDictEntryBuf {
+    pub fn as_buf(&self) -> SizedDictEntryBuf<'_> {
         SizedDictEntryBuf {
             entry: Cow::Borrowed(self),
             slice_ix: 0,

@@ -26,7 +26,7 @@ impl TypedDictEntry {
         self.entry.to_bytes()
     }
 
-    pub fn as_buf(&self) -> SizedDictEntryBuf {
+    pub fn as_buf(&self) -> SizedDictEntryBuf<'_> {
         self.entry.as_buf()
     }
 
@@ -1054,8 +1054,8 @@ mod tests {
             data.freeze(),
         );
 
-        for i in 0..vec.len() {
-            assert_eq!(vec[i], dict.entry(i + 1).unwrap())
+        for (i, entry) in vec.iter().enumerate() {
+            assert_eq!(*entry, dict.entry(i + 1).unwrap())
         }
     }
 
@@ -1099,8 +1099,8 @@ mod tests {
             data.freeze(),
         );
 
-        for i in 0..vec.len() {
-            assert_eq!(vec[i], dict.entry(i + 1).unwrap())
+        for (i, entry) in vec.iter().enumerate() {
+            assert_eq!(*entry, dict.entry(i + 1).unwrap())
         }
     }
 
@@ -1221,8 +1221,8 @@ mod tests {
             data.freeze(),
         );
 
-        for i in 0..vec.len() {
-            assert_eq!(vec[i], dict.entry(i + 1).unwrap())
+        for (i, entry) in vec.iter().enumerate() {
+            assert_eq!(*entry, dict.entry(i + 1).unwrap())
         }
     }
 
