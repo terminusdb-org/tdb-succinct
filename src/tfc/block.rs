@@ -982,7 +982,7 @@ mod tests {
 
         let expected_bytes: Vec<_> = expected_slices
             .into_iter()
-            .map(|b| Bytes::from(b))
+            .map(Bytes::from)
             .collect();
 
         let actual: Vec<_> = block.suffixes().collect();

@@ -683,8 +683,8 @@ mod tests {
         cycle(-23423423_f32);
         cycle(0_f32);
         cycle(324323_f32);
-        cycle(324323.2343_f32);
-        cycle(-324323.2343_f32);
+        cycle(324_323.22_f32);
+        cycle(-324_323.22_f32);
         cycle(f32::MAX);
         cycle(f32::MIN);
         cycle(f32::NEG_INFINITY);
@@ -751,7 +751,7 @@ mod tests {
             Decimal::make_entry(&Decimal("2348973".to_string())),
             f32::make_entry(&4.389832_f32),
             String::make_entry(&"apple"),
-            f32::make_entry(&23434.389832_f32),
+            f32::make_entry(&23_434.39_f32),
             String::make_entry(&"apply"),
             i32::make_entry(&-500_i32),
             u32::make_entry(&20_u32),
@@ -930,7 +930,7 @@ mod tests {
             Decimal::make_entry(&Decimal("2".to_string())),
             Decimal::make_entry(&Decimal("0".to_string())),
             f32::make_entry(&4.389832_f32),
-            f32::make_entry(&23434.389832_f32),
+            f32::make_entry(&23_434.39_f32),
             Integer::make_entry(&int("239487329872343987")),
         ];
         vec.sort();
