@@ -1275,30 +1275,57 @@ mod tests {
     use super::*;
     use crate::tfc::typed::TypedDictEntry;
 
-    fn make_duration(sign: i8, year: i64, month: u8, day: u8, hour: u8, minute: u8, second: f64) -> Duration {
-        Duration { sign, year, month, day, hour, minute, second }
+    fn make_duration(
+        sign: i8,
+        year: i64,
+        month: u8,
+        day: u8,
+        hour: u8,
+        minute: u8,
+        second: f64,
+    ) -> Duration {
+        Duration {
+            sign,
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+        }
     }
 
     fn make_interval(
-        start_seconds: i64, start_nanos: u32,
-        end_seconds: i64, end_nanos: u32,
-        start_type: u8, end_type: u8,
-        flag: u8, duration: Duration,
+        start_seconds: i64,
+        start_nanos: u32,
+        end_seconds: i64,
+        end_nanos: u32,
+        start_type: u8,
+        end_type: u8,
+        flag: u8,
+        duration: Duration,
     ) -> DateTimeInterval {
         DateTimeInterval {
-            start_seconds, start_nanos,
-            end_seconds, end_nanos,
-            start_type, end_type,
-            flag, duration,
+            start_seconds,
+            start_nanos,
+            end_seconds,
+            end_nanos,
+            start_type,
+            end_type,
+            flag,
+            duration,
         }
     }
 
     #[test]
     fn date_time_interval_round_trip_explicit() {
         let iv = make_interval(
-            1735689600, 0,   // 2025-01-01T00:00:00Z
-            1743465600, 0,   // 2025-04-01T00:00:00Z
-            INTERVAL_COMPONENT_DATE, INTERVAL_COMPONENT_DATE,
+            1735689600,
+            0, // 2025-01-01T00:00:00Z
+            1743465600,
+            0, // 2025-04-01T00:00:00Z
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATE,
             INTERVAL_FLAG_EXPLICIT,
             make_duration(1, 0, 0, 90, 0, 0, 0.0),
         );
@@ -1310,11 +1337,14 @@ mod tests {
     #[test]
     fn date_time_interval_round_trip_start_duration() {
         let iv = make_interval(
-            1735689600, 0,
-            1743465600, 0,
-            INTERVAL_COMPONENT_DATE, INTERVAL_COMPONENT_DATE,
+            1735689600,
+            0,
+            1743465600,
+            0,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATE,
             INTERVAL_FLAG_START_DURATION,
-            make_duration(1, 0, 3, 0, 0, 0, 0.0),  // P3M
+            make_duration(1, 0, 3, 0, 0, 0, 0.0), // P3M
         );
         let bytes = iv.to_lexical();
         let iv2 = DateTimeInterval::from_lexical(bytes);
@@ -1324,9 +1354,12 @@ mod tests {
     #[test]
     fn date_time_interval_round_trip_duration_end() {
         let iv = make_interval(
-            1735689600, 0,
-            1743465600, 0,
-            INTERVAL_COMPONENT_DATETIME, INTERVAL_COMPONENT_DATETIME,
+            1735689600,
+            0,
+            1743465600,
+            0,
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_COMPONENT_DATETIME,
             INTERVAL_FLAG_DURATION_END,
             make_duration(1, 0, 3, 0, 0, 0, 0.0),
         );
@@ -1338,9 +1371,12 @@ mod tests {
     #[test]
     fn date_time_interval_round_trip_with_nanos() {
         let iv = make_interval(
-            1735689600, 500_000_000,
-            1743465600, 999_999_999,
-            INTERVAL_COMPONENT_DATETIME, INTERVAL_COMPONENT_DATETIME,
+            1735689600,
+            500_000_000,
+            1743465600,
+            999_999_999,
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_COMPONENT_DATETIME,
             INTERVAL_FLAG_EXPLICIT,
             make_duration(1, 0, 0, 90, 0, 0, 0.5),
         );
@@ -1353,9 +1389,12 @@ mod tests {
     fn date_time_interval_round_trip_negative_timestamps() {
         // Before Unix epoch: 1969-06-15T00:00:00Z
         let iv = make_interval(
-            -16070400, 0,
-            -8035200, 0,
-            INTERVAL_COMPONENT_DATE, INTERVAL_COMPONENT_DATE,
+            -16070400,
+            0,
+            -8035200,
+            0,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATE,
             INTERVAL_FLAG_EXPLICIT,
             make_duration(1, 0, 0, 93, 0, 0, 0.0),
         );
@@ -1368,14 +1407,22 @@ mod tests {
     fn date_time_interval_preserves_duration_granularity() {
         // P3M and P90D are different durations even if they cover similar spans
         let iv_3m = make_interval(
-            1735689600, 0, 1743465600, 0,
-            INTERVAL_COMPONENT_DATE, INTERVAL_COMPONENT_DATE,
+            1735689600,
+            0,
+            1743465600,
+            0,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATE,
             INTERVAL_FLAG_START_DURATION,
-            make_duration(1, 0, 3, 0, 0, 0, 0.0),  // P3M
+            make_duration(1, 0, 3, 0, 0, 0, 0.0), // P3M
         );
         let iv_90d = make_interval(
-            1735689600, 0, 1743465600, 0,
-            INTERVAL_COMPONENT_DATE, INTERVAL_COMPONENT_DATE,
+            1735689600,
+            0,
+            1743465600,
+            0,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATE,
             INTERVAL_FLAG_START_DURATION,
             make_duration(1, 0, 0, 90, 0, 0, 0.0), // P90D
         );
@@ -1398,14 +1445,22 @@ mod tests {
     fn date_time_interval_sorting_by_start_then_end() {
         // Earlier start sorts first
         let iv_early = make_interval(
-            1000000, 0, 2000000, 0,
-            INTERVAL_COMPONENT_DATE, INTERVAL_COMPONENT_DATE,
+            1000000,
+            0,
+            2000000,
+            0,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATE,
             INTERVAL_FLAG_EXPLICIT,
             make_duration(1, 0, 0, 11, 0, 0, 0.0),
         );
         let iv_late = make_interval(
-            1500000, 0, 2000000, 0,
-            INTERVAL_COMPONENT_DATE, INTERVAL_COMPONENT_DATE,
+            1500000,
+            0,
+            2000000,
+            0,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATE,
             INTERVAL_FLAG_EXPLICIT,
             make_duration(1, 0, 0, 5, 0, 0, 0.0),
         );
@@ -1416,14 +1471,22 @@ mod tests {
 
         // Same start, earlier end sorts first
         let iv_short = make_interval(
-            1000000, 0, 1500000, 0,
-            INTERVAL_COMPONENT_DATE, INTERVAL_COMPONENT_DATE,
+            1000000,
+            0,
+            1500000,
+            0,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATE,
             INTERVAL_FLAG_EXPLICIT,
             make_duration(1, 0, 0, 5, 0, 0, 0.0),
         );
         let iv_long = make_interval(
-            1000000, 0, 2000000, 0,
-            INTERVAL_COMPONENT_DATE, INTERVAL_COMPONENT_DATE,
+            1000000,
+            0,
+            2000000,
+            0,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATE,
             INTERVAL_FLAG_EXPLICIT,
             make_duration(1, 0, 0, 11, 0, 0, 0.0),
         );
@@ -1436,14 +1499,22 @@ mod tests {
     #[test]
     fn date_time_interval_sorting_nanos_tiebreaker() {
         let iv_a = make_interval(
-            1000000, 100, 2000000, 0,
-            INTERVAL_COMPONENT_DATETIME, INTERVAL_COMPONENT_DATETIME,
+            1000000,
+            100,
+            2000000,
+            0,
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_COMPONENT_DATETIME,
             INTERVAL_FLAG_EXPLICIT,
             make_duration(1, 0, 0, 11, 0, 0, 0.0),
         );
         let iv_b = make_interval(
-            1000000, 200, 2000000, 0,
-            INTERVAL_COMPONENT_DATETIME, INTERVAL_COMPONENT_DATETIME,
+            1000000,
+            200,
+            2000000,
+            0,
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_COMPONENT_DATETIME,
             INTERVAL_FLAG_EXPLICIT,
             make_duration(1, 0, 0, 11, 0, 0, 0.0),
         );
@@ -1456,14 +1527,22 @@ mod tests {
     #[test]
     fn date_time_interval_sorting_negative_before_positive() {
         let iv_neg = make_interval(
-            -1000000, 0, 0, 0,
-            INTERVAL_COMPONENT_DATE, INTERVAL_COMPONENT_DATE,
+            -1000000,
+            0,
+            0,
+            0,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATE,
             INTERVAL_FLAG_EXPLICIT,
             make_duration(1, 0, 0, 11, 0, 0, 0.0),
         );
         let iv_pos = make_interval(
-            1000000, 0, 2000000, 0,
-            INTERVAL_COMPONENT_DATE, INTERVAL_COMPONENT_DATE,
+            1000000,
+            0,
+            2000000,
+            0,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATE,
             INTERVAL_FLAG_EXPLICIT,
             make_duration(1, 0, 0, 11, 0, 0, 0.0),
         );
@@ -1475,10 +1554,18 @@ mod tests {
 
     #[test]
     fn date_time_interval_flag_values_preserved() {
-        for flag in [INTERVAL_FLAG_EXPLICIT, INTERVAL_FLAG_START_DURATION, INTERVAL_FLAG_DURATION_END] {
+        for flag in [
+            INTERVAL_FLAG_EXPLICIT,
+            INTERVAL_FLAG_START_DURATION,
+            INTERVAL_FLAG_DURATION_END,
+        ] {
             let iv = make_interval(
-                1735689600, 0, 1743465600, 0,
-                INTERVAL_COMPONENT_DATE, INTERVAL_COMPONENT_DATE,
+                1735689600,
+                0,
+                1743465600,
+                0,
+                INTERVAL_COMPONENT_DATE,
+                INTERVAL_COMPONENT_DATE,
                 flag,
                 make_duration(1, 0, 3, 0, 0, 0, 0.0),
             );
@@ -1490,8 +1577,12 @@ mod tests {
     #[test]
     fn date_time_interval_component_types_preserved() {
         let iv = make_interval(
-            1735689600, 0, 1743465600, 500_000,
-            INTERVAL_COMPONENT_DATE, INTERVAL_COMPONENT_DATETIME,
+            1735689600,
+            0,
+            1743465600,
+            500_000,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATETIME,
             INTERVAL_FLAG_EXPLICIT,
             make_duration(1, 0, 0, 90, 0, 0, 0.0),
         );
@@ -1504,20 +1595,32 @@ mod tests {
     fn date_time_interval_mixed_in_typed_dict_sort() {
         let mut entries: Vec<TypedDictEntry> = vec![
             DateTimeInterval::make_entry(&make_interval(
-                2000000, 0, 3000000, 0,
-                INTERVAL_COMPONENT_DATE, INTERVAL_COMPONENT_DATE,
+                2000000,
+                0,
+                3000000,
+                0,
+                INTERVAL_COMPONENT_DATE,
+                INTERVAL_COMPONENT_DATE,
                 INTERVAL_FLAG_EXPLICIT,
                 make_duration(1, 0, 0, 11, 0, 0, 0.0),
             )),
             DateTimeInterval::make_entry(&make_interval(
-                1000000, 0, 3000000, 0,
-                INTERVAL_COMPONENT_DATE, INTERVAL_COMPONENT_DATE,
+                1000000,
+                0,
+                3000000,
+                0,
+                INTERVAL_COMPONENT_DATE,
+                INTERVAL_COMPONENT_DATE,
                 INTERVAL_FLAG_EXPLICIT,
                 make_duration(1, 0, 0, 23, 0, 0, 0.0),
             )),
             DateTimeInterval::make_entry(&make_interval(
-                1000000, 0, 2000000, 0,
-                INTERVAL_COMPONENT_DATE, INTERVAL_COMPONENT_DATE,
+                1000000,
+                0,
+                2000000,
+                0,
+                INTERVAL_COMPONENT_DATE,
+                INTERVAL_COMPONENT_DATE,
                 INTERVAL_FLAG_START_DURATION,
                 make_duration(1, 0, 0, 11, 0, 0, 0.0),
             )),
@@ -1540,9 +1643,12 @@ mod tests {
     #[test]
     fn date_time_interval_iso_string_explicit_dates() {
         let iv = make_interval(
-            1735689600, 0,   // 2025-01-01T00:00:00Z
-            1743465600, 0,   // 2025-04-01T00:00:00Z
-            INTERVAL_COMPONENT_DATE, INTERVAL_COMPONENT_DATE,
+            1735689600,
+            0, // 2025-01-01T00:00:00Z
+            1743465600,
+            0, // 2025-04-01T00:00:00Z
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATE,
             INTERVAL_FLAG_EXPLICIT,
             make_duration(1, 0, 0, 90, 0, 0, 0.0),
         );
@@ -1554,9 +1660,12 @@ mod tests {
     fn date_time_interval_iso_string_explicit_datetimes_with_time() {
         // 2025-01-01T10:30:00Z and 2025-04-01T15:45:00Z
         let iv = make_interval(
-            1735727400, 0,   // 2025-01-01T10:30:00Z
-            1743522300, 0,   // 2025-04-01T15:45:00Z
-            INTERVAL_COMPONENT_DATETIME, INTERVAL_COMPONENT_DATETIME,
+            1735727400,
+            0, // 2025-01-01T10:30:00Z
+            1743522300,
+            0, // 2025-04-01T15:45:00Z
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_COMPONENT_DATETIME,
             INTERVAL_FLAG_EXPLICIT,
             make_duration(1, 0, 0, 90, 5, 15, 0.0),
         );
@@ -1567,9 +1676,12 @@ mod tests {
     #[test]
     fn date_time_interval_iso_string_explicit_with_nanos() {
         let iv = make_interval(
-            1735689600, 500_000_000,
-            1743465600, 0,
-            INTERVAL_COMPONENT_DATETIME, INTERVAL_COMPONENT_DATE,
+            1735689600,
+            500_000_000,
+            1743465600,
+            0,
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_COMPONENT_DATE,
             INTERVAL_FLAG_EXPLICIT,
             make_duration(1, 0, 0, 90, 0, 0, 0.0),
         );
@@ -1580,9 +1692,12 @@ mod tests {
     #[test]
     fn date_time_interval_iso_string_start_duration() {
         let iv = make_interval(
-            1735689600, 0,
-            1743465600, 0,
-            INTERVAL_COMPONENT_DATE, INTERVAL_COMPONENT_DATE,
+            1735689600,
+            0,
+            1743465600,
+            0,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATE,
             INTERVAL_FLAG_START_DURATION,
             make_duration(1, 0, 3, 0, 0, 0, 0.0),
         );
@@ -1593,9 +1708,12 @@ mod tests {
     #[test]
     fn date_time_interval_iso_string_duration_end() {
         let iv = make_interval(
-            1735689600, 0,
-            1743465600, 0,
-            INTERVAL_COMPONENT_DATE, INTERVAL_COMPONENT_DATE,
+            1735689600,
+            0,
+            1743465600,
+            0,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATE,
             INTERVAL_FLAG_DURATION_END,
             make_duration(1, 0, 3, 0, 0, 0, 0.0),
         );
@@ -1606,9 +1724,12 @@ mod tests {
     #[test]
     fn date_time_interval_iso_string_duration_with_time_parts() {
         let iv = make_interval(
-            1735689600, 0,
-            1735693200, 0,   // 1 hour later
-            INTERVAL_COMPONENT_DATETIME, INTERVAL_COMPONENT_DATETIME,
+            1735689600,
+            0,
+            1735693200,
+            0, // 1 hour later
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_COMPONENT_DATETIME,
             INTERVAL_FLAG_START_DURATION,
             make_duration(1, 0, 0, 0, 1, 0, 0.0),
         );
@@ -1619,9 +1740,12 @@ mod tests {
     #[test]
     fn date_time_interval_iso_string_midnight_datetime_renders_time() {
         let iv = make_interval(
-            1735689600, 0,   // 2025-01-01T00:00:00Z (midnight)
-            1743465600, 0,   // 2025-04-01T00:00:00Z (midnight)
-            INTERVAL_COMPONENT_DATETIME, INTERVAL_COMPONENT_DATETIME,
+            1735689600,
+            0, // 2025-01-01T00:00:00Z (midnight)
+            1743465600,
+            0, // 2025-04-01T00:00:00Z (midnight)
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_COMPONENT_DATETIME,
             INTERVAL_FLAG_EXPLICIT,
             make_duration(1, 0, 0, 90, 0, 0, 0.0),
         );
@@ -1647,9 +1771,12 @@ mod tests {
     #[test]
     fn date_time_interval_iso_string_with_tenth_second_period() {
         let iv = make_interval(
-            1735689600, 0,
-            1735689600, 100_000_000,
-            INTERVAL_COMPONENT_DATETIME, INTERVAL_COMPONENT_DATETIME,
+            1735689600,
+            0,
+            1735689600,
+            100_000_000,
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_COMPONENT_DATETIME,
             INTERVAL_FLAG_EXPLICIT,
             make_duration(1, 0, 0, 0, 0, 0, 0.1),
         );
@@ -1660,9 +1787,12 @@ mod tests {
     #[test]
     fn date_time_interval_iso_string_start_duration_tenth_second() {
         let iv = make_interval(
-            1735689600, 0,
-            1735689600, 100_000_000,
-            INTERVAL_COMPONENT_DATETIME, INTERVAL_COMPONENT_DATETIME,
+            1735689600,
+            0,
+            1735689600,
+            100_000_000,
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_COMPONENT_DATETIME,
             INTERVAL_FLAG_START_DURATION,
             make_duration(1, 0, 0, 0, 0, 0, 0.1),
         );
@@ -1673,8 +1803,12 @@ mod tests {
     #[test]
     fn date_time_interval_encoding_is_48_bytes() {
         let iv = make_interval(
-            1735689600, 0, 1743465600, 0,
-            INTERVAL_COMPONENT_DATE, INTERVAL_COMPONENT_DATE,
+            1735689600,
+            0,
+            1743465600,
+            0,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATE,
             INTERVAL_FLAG_EXPLICIT,
             make_duration(1, 0, 3, 0, 0, 0, 0.0),
         );
