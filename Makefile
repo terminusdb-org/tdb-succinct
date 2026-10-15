@@ -1,4 +1,4 @@
-.PHONY: help build test clippy check fmt check-fmt clean
+.PHONY: help build test clippy check fmt check-fmt clean pr
 
 help: ## Show this help message
 	@echo "Available targets:"
@@ -24,3 +24,5 @@ check-fmt: ## Check formatting without changing files
 
 clean: ## Remove build artifacts
 	cargo clean
+
+pr: check-fmt clippy test ## Run pre-PR checks (fmt, clippy, tests)
