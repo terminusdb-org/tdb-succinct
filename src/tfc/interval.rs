@@ -91,12 +91,8 @@ pub fn parse_iso_interval(s: &str) -> Result<DateTimeInterval, IntervalParseErro
         // start/end (explicit)
         let (start_seconds, start_nanos, start_type) = parse_date_or_datetime(left, false)?;
         let (end_seconds, end_nanos, end_type) = parse_date_or_datetime(right, true)?;
-        let duration = compute_duration_from_endpoints(
-            start_seconds,
-            start_nanos,
-            end_seconds,
-            end_nanos,
-        );
+        let duration =
+            compute_duration_from_endpoints(start_seconds, start_nanos, end_seconds, end_nanos);
         Ok(DateTimeInterval {
             start_seconds,
             start_nanos,
@@ -127,7 +123,11 @@ fn parse_date_or_datetime(s: &str, is_end: bool) -> Result<(i64, u32, u8), Inter
                     .map(|ndt| ndt.and_utc())
             })
             .map_err(|_| IntervalParseError::InvalidDateTime(s.to_string()))?;
-        Ok((dt.timestamp(), dt.timestamp_subsec_nanos(), INTERVAL_COMPONENT_DATETIME))
+        Ok((
+            dt.timestamp(),
+            dt.timestamp_subsec_nanos(),
+            INTERVAL_COMPONENT_DATETIME,
+        ))
     } else {
         // Date only
         let mut nd = NaiveDate::parse_from_str(s, "%Y-%m-%d")
@@ -332,8 +332,7 @@ fn compute_end_from_start_and_duration(
     // Add year/month via chrono
     let mut dt = start_dt;
     if duration.year != 0 || duration.month != 0 {
-        let total_months =
-            sign * (duration.year * 12 + duration.month as i64);
+        let total_months = sign * (duration.year * 12 + duration.month as i64);
         dt = add_months(dt, total_months as i32);
     }
 
@@ -345,8 +344,7 @@ fn compute_end_from_start_and_duration(
             + duration.second as i64);
 
     let end_seconds = dt.and_utc().timestamp() + day_seconds;
-    let frac_nanos = ((duration.second.fract() * 1_000_000_000.0) as u32)
-        .wrapping_mul(sign as u32);
+    let frac_nanos = ((duration.second.fract() * 1_000_000_000.0) as u32).wrapping_mul(sign as u32);
     let end_nanos = start_nanos.wrapping_add(frac_nanos);
 
     (end_seconds, end_nanos)
@@ -371,8 +369,7 @@ fn compute_start_from_duration_and_end(
 
     let mut dt = end_dt;
     if duration.year != 0 || duration.month != 0 {
-        let total_months =
-            sign * (duration.year * 12 + duration.month as i64);
+        let total_months = sign * (duration.year * 12 + duration.month as i64);
         dt = add_months(dt, total_months as i32);
     }
 
@@ -383,8 +380,7 @@ fn compute_start_from_duration_and_end(
             + duration.second as i64);
 
     let start_seconds = dt.and_utc().timestamp() + day_seconds;
-    let frac_nanos = ((duration.second.fract() * 1_000_000_000.0) as u32)
-        .wrapping_mul(sign as u32);
+    let frac_nanos = ((duration.second.fract() * 1_000_000_000.0) as u32).wrapping_mul(sign as u32);
     let start_nanos = end_nanos.wrapping_add(frac_nanos);
 
     (start_seconds, start_nanos)

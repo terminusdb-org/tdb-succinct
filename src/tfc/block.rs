@@ -980,10 +980,7 @@ mod tests {
             b"eeeeeeeeeeeeeee",
         ];
 
-        let expected_bytes: Vec<_> = expected_slices
-            .into_iter()
-            .map(Bytes::from)
-            .collect();
+        let expected_bytes: Vec<_> = expected_slices.into_iter().map(Bytes::from).collect();
 
         let actual: Vec<_> = block.suffixes().collect();
 

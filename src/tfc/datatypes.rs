@@ -1121,7 +1121,12 @@ impl FromLexical<DateTimeInterval> for DateTimeInterval {
 fn interval_component_to_iso(seconds: i64, nanos: u32) -> String {
     let ndt = DateTime::from_timestamp(seconds, nanos)
         .map(|dt| dt.naive_utc())
-        .unwrap_or_else(|| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap());
+        .unwrap_or_else(|| {
+            NaiveDate::from_ymd_opt(1970, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+        });
     if nanos == 0 {
         ndt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
     } else {
