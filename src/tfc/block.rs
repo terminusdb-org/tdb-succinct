@@ -211,7 +211,7 @@ impl SizedDictEntry {
         v
     }
 
-    pub fn as_buf(&self) -> SizedDictEntryBuf {
+    pub fn as_buf(&self) -> SizedDictEntryBuf<'_> {
         SizedDictEntryBuf {
             entry: Cow::Borrowed(self),
             slice_ix: 0,
@@ -832,7 +832,7 @@ mod tests {
 
     fn build_block_bytes(strings: &[&[u8]]) -> Bytes {
         let mut buf = BytesMut::new();
-        build_block_unchecked(None, &mut buf, &strings);
+        build_block_unchecked(None, &mut buf, strings);
 
         buf.freeze()
     }
@@ -982,7 +982,7 @@ mod tests {
 
         let expected_bytes: Vec<_> = expected_slices
             .into_iter()
-            .map(|b| Bytes::from(b))
+            .map(Bytes::from)
             .collect();
 
         let actual: Vec<_> = block.suffixes().collect();

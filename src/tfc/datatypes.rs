@@ -7,7 +7,7 @@ use super::{
 use base64::display::Base64Display;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime};
 use num_derive::FromPrimitive;
 use rug::Integer;
 
@@ -1119,7 +1119,8 @@ impl FromLexical<DateTimeInterval> for DateTimeInterval {
 }
 
 fn interval_component_to_iso(seconds: i64, nanos: u32) -> String {
-    let ndt = NaiveDateTime::from_timestamp_opt(seconds, nanos)
+    let ndt = DateTime::from_timestamp(seconds, nanos)
+        .map(|dt| dt.naive_utc())
         .unwrap_or_else(|| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap());
     if nanos == 0 {
         ndt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
@@ -1621,6 +1622,47 @@ mod tests {
         );
         let s = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
         assert_eq!("2025-01-01T00:00:00Z/2025-04-01T00:00:00Z", s);
+    }
+
+    #[test]
+    fn duration_to_string_tenth_second() {
+        let duration = Duration {
+            sign: 1,
+            year: 0,
+            month: 0,
+            day: 0,
+            hour: 0,
+            minute: 0,
+            second: 0.1,
+        };
+        let s = duration_string(&duration);
+        assert_eq!("PT0.1S", s);
+    }
+
+    #[test]
+    fn date_time_interval_iso_string_with_tenth_second_period() {
+        let iv = make_interval(
+            1735689600, 0,
+            1735689600, 100_000_000,
+            INTERVAL_COMPONENT_DATETIME, INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_FLAG_EXPLICIT,
+            make_duration(1, 0, 0, 0, 0, 0, 0.1),
+        );
+        let s = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
+        assert_eq!("2025-01-01T00:00:00Z/2025-01-01T00:00:00.100Z", s);
+    }
+
+    #[test]
+    fn date_time_interval_iso_string_start_duration_tenth_second() {
+        let iv = make_interval(
+            1735689600, 0,
+            1735689600, 100_000_000,
+            INTERVAL_COMPONENT_DATETIME, INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_FLAG_START_DURATION,
+            make_duration(1, 0, 0, 0, 0, 0, 0.1),
+        );
+        let s = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
+        assert_eq!("2025-01-01T00:00:00Z/PT0.1S", s);
     }
 
     #[test]

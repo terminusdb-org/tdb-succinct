@@ -117,8 +117,8 @@ pub fn parse_iso_interval(s: &str) -> Result<DateTimeInterval, IntervalParseErro
 /// ISO 8601 end dates.
 fn parse_date_or_datetime(s: &str, is_end: bool) -> Result<(i64, u32, u8), IntervalParseError> {
     if s.contains('T') {
-        // DateTime: try RFC 3339 first (Z or numeric offsets), then fall back to a
-        // naive datetime interpreted as UTC.
+        // DateTime: try RFC 3339 first (handles Z and numeric offsets), then fall
+        // back to naive ISO 8601 datetimes which are interpreted as UTC.
         let dt = DateTime::parse_from_rfc3339(s)
             .map(|dt| dt.with_timezone(&Utc))
             .or_else(|_| {
@@ -286,8 +286,9 @@ fn compute_duration_from_endpoints(
 ) -> Duration {
     // Compute the full elapsed interval in nanoseconds so sub-second explicit
     // intervals get a correct duration.
-    let total_nanos = (end_seconds as i128 - start_seconds as i128) * 1_000_000_000
-        + (end_nanos as i128 - start_nanos as i128);
+    let start_total_nanos = start_seconds as i128 * 1_000_000_000 + start_nanos as i128;
+    let end_total_nanos = end_seconds as i128 * 1_000_000_000 + end_nanos as i128;
+    let total_nanos = end_total_nanos - start_total_nanos;
     let sign = if total_nanos >= 0 { 1 } else { -1 };
     let abs_total_nanos = total_nanos.unsigned_abs();
     let days = (abs_total_nanos / 86_400_000_000_000) as u8;
@@ -296,9 +297,9 @@ fn compute_duration_from_endpoints(
     let remainder = remainder % 3_600_000_000_000;
     let minutes = (remainder / 60_000_000_000) as u8;
     let remainder = remainder % 60_000_000_000;
-    let seconds = (remainder / 1_000_000_000) as u8;
+    let secs = (remainder / 1_000_000_000) as u8;
     let nanos = (remainder % 1_000_000_000) as u32;
-    let second = seconds as f64 + nanos as f64 / 1_000_000_000.0;
+    let second = secs as f64 + nanos as f64 / 1_000_000_000.0;
     Duration {
         sign,
         year: 0,
@@ -317,7 +318,8 @@ fn compute_end_from_start_and_duration(
     start_seconds: i64,
     start_nanos: u32,
 ) -> (i64, u32) {
-    let start_dt = NaiveDateTime::from_timestamp_opt(start_seconds, start_nanos)
+    let start_dt = DateTime::from_timestamp(start_seconds, start_nanos)
+        .map(|dt| dt.naive_utc())
         .unwrap_or_else(|| {
             NaiveDate::from_ymd_opt(1970, 1, 1)
                 .unwrap()
@@ -356,7 +358,8 @@ fn compute_start_from_duration_and_end(
     end_seconds: i64,
     end_nanos: u32,
 ) -> (i64, u32) {
-    let end_dt = NaiveDateTime::from_timestamp_opt(end_seconds, end_nanos)
+    let end_dt = DateTime::from_timestamp(end_seconds, end_nanos)
+        .map(|dt| dt.naive_utc())
         .unwrap_or_else(|| {
             NaiveDate::from_ymd_opt(1970, 1, 1)
                 .unwrap()
@@ -460,6 +463,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_explicit_datetime_with_timezone_offset_and_nanos() {
+        // +02:00 means the local 09:00:00 is 07:00:00Z.
+        let s = "2025-01-01T09:00:00.000+02:00/2025-01-01T09:00:00.123456789+02:00";
+        let iv = parse_iso_interval(s).unwrap();
+        assert_eq!(iv.start_seconds, 1735689600 + 7 * 3600);
+        assert_eq!(iv.start_nanos, 0);
+        assert_eq!(iv.end_seconds, 1735689600 + 7 * 3600);
+        assert_eq!(iv.end_nanos, 123_456_789);
+        assert_eq!(iv.duration.second, 0.123456789);
+    }
+
+    #[test]
+    fn roundtrip_explicit_datetime_with_timezone_offset_and_nanos() {
+        let s = "2025-01-01T09:00:00.000+02:00/2025-01-01T09:00:00.123456789+02:00";
+        let iv = parse_iso_interval(s).unwrap();
+        let round = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
+        assert_eq!(round, "2025-01-01T07:00:00Z/2025-01-01T07:00:00.123456789Z");
+    }
+
+    #[test]
     fn parse_start_duration() {
         let iv = parse_iso_interval("2025-01-01/P3M").unwrap();
         assert_eq!(iv.flag, INTERVAL_FLAG_START_DURATION);
@@ -532,7 +555,7 @@ mod tests {
         let iv = parse_iso_interval("2025-01-01/2025-04-01").unwrap();
         let bytes = iv.to_lexical();
         let s = <String as FromLexical<DateTimeInterval>>::from_lexical(bytes);
-        assert_eq!("2025-01-01T00:00:00Z/2025-04-02T00:00:00Z", s);
+        assert_eq!("2025-01-01T00:00:00Z/2025-04-01T00:00:00Z", s);
     }
 
     #[test]
@@ -548,7 +571,7 @@ mod tests {
         let iv = parse_iso_interval("P3M/2025-04-01").unwrap();
         let bytes = iv.to_lexical();
         let s = <String as FromLexical<DateTimeInterval>>::from_lexical(bytes);
-        assert_eq!("P3M/2025-04-02T00:00:00Z", s);
+        assert_eq!("P3M/2025-04-01T00:00:00Z", s);
     }
 
     #[test]
