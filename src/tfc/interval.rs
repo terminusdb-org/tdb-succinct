@@ -34,6 +34,13 @@ pub enum IntervalParseError {
 /// Date components: `YYYY-MM-DD`
 /// DateTime components: `YYYY-MM-DDTHH:MM:SS[.fff]Z` (trailing Z required for now)
 /// Duration: `PnYnMnDTnHnMnS` (standard ISO 8601 duration)
+///
+/// A date component denotes the whole day as an interval — the start of the
+/// day through its end, in UTC when no timezone is given. A date-only
+/// interval like `2020-02-01/2020-02-29` is therefore the inclusive span
+/// `2020-02-01T00:00:00Z/2020-03-01T00:00:00Z`: the start date contributes
+/// its start, the end date contributes its end. ISO 8601 is silent on this;
+/// this is the convention implemented here.
 pub fn parse_iso_interval(s: &str) -> Result<DateTimeInterval, IntervalParseError> {
     if s.is_empty() {
         return Err(IntervalParseError::Empty);
@@ -548,7 +555,9 @@ mod tests {
 
     #[test]
     fn roundtrip_parse_to_lexical_to_string_explicit() {
-        let iv = parse_iso_interval("2025-01-01/2025-04-01").unwrap();
+        // Q1 written as inclusive dates: the end of 2025-03-31 renders as the
+        // canonical exclusive instant 2025-04-01T00:00:00Z.
+        let iv = parse_iso_interval("2025-01-01/2025-03-31").unwrap();
         let bytes = iv.to_lexical();
         let s = <String as FromLexical<DateTimeInterval>>::from_lexical(bytes);
         assert_eq!("2025-01-01T00:00:00Z/2025-04-01T00:00:00Z", s);
@@ -564,7 +573,9 @@ mod tests {
 
     #[test]
     fn roundtrip_parse_to_lexical_to_string_duration_end() {
-        let iv = parse_iso_interval("P3M/2025-04-01").unwrap();
+        // Same rule: P3M ending on 2025-03-31 is the quarter, rendered as the
+        // exclusive instant 2025-04-01T00:00:00Z.
+        let iv = parse_iso_interval("P3M/2025-03-31").unwrap();
         let bytes = iv.to_lexical();
         let s = <String as FromLexical<DateTimeInterval>>::from_lexical(bytes);
         assert_eq!("P3M/2025-04-01T00:00:00Z", s);
