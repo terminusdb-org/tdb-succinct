@@ -13,7 +13,7 @@
 //! timeshift, flag) only breaks ties between identical instant pairs.
 //! `period` is the supplied canonical duration for `T/P`/`P/T` forms and the
 //! canonical *derived* period for `T/T` — greedy `Y M D H Min S` anchored at
-//! the start (`PT0S` for a zero span) — so equal spans cluster whatever the
+//! the start (`PT0S` for a zero span — the maximum-precision canonical) — so equal spans cluster whatever the
 //! form. `tshift` is the timezone axis — class byte plus signed i16 offset
 //! minutes for `±HH:MM` spellings.
 //!
@@ -550,11 +550,7 @@ pub fn parse_lexical_interval(s: &str) -> Result<LexicalInterval, LexicalInterva
                     canonical: canonicalise_component(s),
                     ..f
                 },
-                _ => {
-                    return Err(
-                        IntervalParseError::MissingSeparator(s.to_string()).into()
-                    )
-                }
+                _ => return Err(IntervalParseError::MissingSeparator(s.to_string()).into()),
             };
             return Ok(LexicalInterval {
                 start: Component::Finite(f.clone()),
@@ -572,6 +568,10 @@ pub fn parse_lexical_interval(s: &str) -> Result<LexicalInterval, LexicalInterva
         return Err(IntervalParseError::TwoDurations(s.to_string()).into());
     }
 
+    // The supplied spellings are the value: `P2W` and `P14D` are equal
+    // durations but different literals, and equal literals must encode
+    // identically — so the period side keeps its spelling (canonicalised
+    // only for separators), never normalised through parts.
     let canonical = format!(
         "{}/{}",
         canonicalise_component(left),
@@ -841,7 +841,7 @@ fn sub_frac(a: Option<&str>, b: Option<&str>) -> (i64, Option<String>) {
 /// decomposition `Y M D H Min S` anchored at the start's wall-clock frame
 /// (its own timeshift — a three-month local span derives `P3M` whatever the
 /// zone spelling). `W` is never emitted; a zero span is `PT0S`.
-fn derived_period(iv: &LexicalInterval) -> String {
+pub fn derived_period(iv: &LexicalInterval) -> String {
     let (Component::Finite(s), Component::Finite(e)) = (&iv.start, &iv.end) else {
         return String::new();
     };
@@ -1559,39 +1559,167 @@ use crate::storage::types::{FileLoad, FileStore};
 use crate::wavelettree::build_wavelet_tree_from_iter;
 use std::io;
 
-/// Canonical `P…` rendering of a fixed-width `Duration`, in the shape
-/// `derived_period` emits: zero is `PT0S`, negatives take a leading `-`.
-fn duration_to_period(d: &Duration) -> String {
+/// Canonical `P…` spelling of a duration given as parts: zero is `PT0S`
+/// (the maximum-precision spelling — seconds-precision zero), negatives
+/// take a leading `-`, and zero components are omitted. `second` is a
+/// canonical digit string — supplied fraction digits are preserved.
+pub fn duration_parts_to_period(
+    sign: i8,
+    week: i64,
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: &str,
+) -> String {
+    // ISO week form is exclusive: `PnW` never combines with other fields.
+    // assert, not debug_assert: a violating caller would silently emit
+    // `PnW` and drop the other components — wrong bytes in release too.
+    assert!(
+        week == 0
+            || (year == 0
+                && month == 0
+                && day == 0
+                && hour == 0
+                && minute == 0
+                && second.bytes().all(|b| b == b'0' || b == b'.')),
+        "week form cannot combine with other fields"
+    );
+    if week != 0 {
+        return if sign < 0 {
+            format!("-P{}W", week)
+        } else {
+            format!("P{}W", week)
+        };
+    }
     let mut p = String::from("P");
-    if d.year != 0 {
-        p += &format!("{}Y", d.year);
+    if year != 0 {
+        p += &format!("{year}Y");
     }
-    if d.month != 0 {
-        p += &format!("{}M", d.month);
+    if month != 0 {
+        p += &format!("{month}M");
     }
-    if d.day != 0 {
-        p += &format!("{}D", d.day);
+    if day != 0 {
+        p += &format!("{day}D");
     }
-    if d.hour != 0 || d.minute != 0 || d.second != 0.0 {
+    let seconds_zero = second.chars().all(|c| c == '0' || c == '.');
+    if hour != 0 || minute != 0 || !seconds_zero {
         p += "T";
-        if d.hour != 0 {
-            p += &format!("{}H", d.hour);
+        if hour != 0 {
+            p += &format!("{hour}H");
         }
-        if d.minute != 0 {
-            p += &format!("{}M", d.minute);
+        if minute != 0 {
+            p += &format!("{minute}M");
         }
-        if d.second != 0.0 {
-            p += &format!("{}S", d.second);
+        if !seconds_zero {
+            p += &format!("{second}S");
         }
     }
     if p == "P" {
         p = "PT0S".to_string();
     }
-    if d.sign < 0 {
+    if sign < 0 {
         format!("-{p}")
     } else {
         p
     }
+}
+
+/// Canonical `P…` rendering of a fixed-width `Duration` — delegates to
+/// `duration_parts_to_period`, which owns the spelling rules.
+fn duration_to_period(d: &Duration) -> String {
+    duration_parts_to_period(
+        d.sign,
+        0,
+        d.year,
+        d.month as i64,
+        d.day as i64,
+        d.hour as i64,
+        d.minute as i64,
+        &format!("{}", d.second),
+    )
+}
+
+/// A canonical `P…` spelling back into parts — the strict inverse of
+/// `duration_parts_to_period`. Seconds return as the stored digit string;
+/// components must fit `i64` (a wider value is a caller's term-contract
+/// problem, not this parser's).
+pub fn period_to_parts(
+    period: &str,
+) -> Result<(i8, i64, i64, i64, i64, i64, i64, String), LexicalIntervalError> {
+    fn num<'a>(s: &mut &'a str, unit: u8) -> Result<Option<i64>, LexicalIntervalError> {
+        let digits = s.bytes().take_while(|b| b.is_ascii_digit()).count();
+        match s.as_bytes().get(digits) {
+            Some(&b) if b == unit => {
+                let v: i64 = s[..digits]
+                    .parse()
+                    .map_err(|_| LexicalIntervalError::MalformedEntry)?;
+                *s = &s[digits + 1..];
+                Ok(Some(v))
+            }
+            _ => Ok(None),
+        }
+    }
+    let (sign, rest) = match period.strip_prefix('-') {
+        Some(r) => (-1i8, r),
+        None => (1i8, period),
+    };
+    let body = rest
+        .strip_prefix('P')
+        .ok_or(LexicalIntervalError::MalformedEntry)?;
+    if body.is_empty() {
+        return Err(LexicalIntervalError::MalformedEntry);
+    }
+    // Week form is exclusive (`PnW` only) — keeps its denomination.
+    if let Some(w) = body.strip_suffix('W') {
+        if w.bytes().all(|b| b.is_ascii_digit()) && !w.is_empty() {
+            let week: i64 = w
+                .parse::<i64>()
+                .map_err(|_| LexicalIntervalError::MalformedEntry)?;
+            return Ok((sign, week, 0, 0, 0, 0, 0, "0".to_string()));
+        }
+    }
+    let (mut ymd, hms) = match body.split_once('T') {
+        Some((a, b)) => (a, Some(b)),
+        None => (body, None),
+    };
+    let (year, month, day) = (
+        num(&mut ymd, b'Y')?.unwrap_or(0),
+        num(&mut ymd, b'M')?.unwrap_or(0),
+        num(&mut ymd, b'D')?.unwrap_or(0),
+    );
+    if !ymd.is_empty() {
+        return Err(LexicalIntervalError::MalformedEntry);
+    }
+    let (mut hour, mut minute, mut second) = (0, 0, "0".to_string());
+    if let Some(mut t) = hms {
+        if t.is_empty() {
+            return Err(LexicalIntervalError::MalformedEntry);
+        }
+        hour = num(&mut t, b'H')?.unwrap_or(0);
+        minute = num(&mut t, b'M')?.unwrap_or(0);
+        let digits = t
+            .bytes()
+            .take_while(|b| b.is_ascii_digit() || *b == b'.')
+            .count();
+        if t.as_bytes().get(digits) == Some(&b'S') {
+            let s = &t[..digits];
+            if s.is_empty()
+                || s.starts_with('.')
+                || s.ends_with('.')
+                || s.bytes().filter(|b| *b == b'.').count() > 1
+            {
+                return Err(LexicalIntervalError::MalformedEntry);
+            }
+            second = s.to_string();
+            t = &t[digits + 1..];
+        }
+        if !t.is_empty() {
+            return Err(LexicalIntervalError::MalformedEntry);
+        }
+    }
+    Ok((sign, 0, year, month, day, hour, minute, second))
 }
 
 /// One fixed-width endpoint as a lexical `Component`. The stored seconds are
@@ -1692,6 +1820,42 @@ pub fn legacy_interval_to_lexical(iv: &DateTimeInterval) -> LexicalInterval {
     }
 }
 
+/// Build a `LexicalInterval` from fixed-width component tuples and a
+/// canonical period string — the marshal path for Prolog
+/// `date_time_interval` terms. `period` is stored verbatim for the
+/// duration forms and ignored for `INTERVAL_FLAG_EXPLICIT`, whose stored
+/// period is derived at encode time. Unlike the `DateTimeInterval` route,
+/// the period is a string: day counts past the legacy `u8` field marshal
+/// through.
+pub fn lexical_interval_from_parts(
+    start: (i64, u32, u8, i16),
+    end: (i64, u32, u8, i16),
+    flag: u8,
+    period: &str,
+) -> LexicalInterval {
+    let s = legacy_component(start.0, start.1, start.2, start.3, false);
+    let e = legacy_component(end.0, end.1, end.2, end.3, true);
+    let canonical = match flag {
+        INTERVAL_FLAG_DURATION_END => {
+            format!("{}/{}", period, component_canonical(&e, true))
+        }
+        INTERVAL_FLAG_START_DURATION => {
+            format!("{}/{}", component_canonical(&s, false), period)
+        }
+        _ => format!(
+            "{}/{}",
+            component_canonical(&s, false),
+            component_canonical(&e, true)
+        ),
+    };
+    LexicalInterval {
+        start: s,
+        end: e,
+        flag,
+        canonical,
+    }
+}
+
 /// `TypedDictEntry` for a lexical interval — the constructor callers use
 /// instead of spelling out the SizedDictEntry plumbing.
 pub fn lexical_interval_entry(iv: &LexicalInterval) -> TypedDictEntry {
@@ -1710,65 +1874,35 @@ pub fn lexical_interval_entry(iv: &LexicalInterval) -> TypedDictEntry {
 /// endpoints render as open — that is their comparison semantics — and a
 /// leap-second instant lands on the following second, matching the probe
 /// convention.
-pub fn lexical_interval_to_legacy(iv: &LexicalInterval) -> Option<DateTimeInterval> {
-    fn legacy_component_of(c: &Component) -> Option<(i64, u32, u8, i16)> {
-        match c {
-            Component::Unbounded | Component::Unspecified => {
-                Some((0, 0, INTERVAL_COMPONENT_OPEN, INTERVAL_NO_ZONE))
+/// A lexical `Component` back as a fixed-width `(seconds, nanos, type, tz)`
+/// tuple — the inverse of `legacy_component`, for bridges that still speak
+/// the legacy term shape. `None` when the value can't fit: fractions finer
+/// than nanoseconds or an out-of-`i64` instant.
+pub fn legacy_component_of(c: &Component) -> Option<(i64, u32, u8, i16)> {
+    match c {
+        Component::Unbounded | Component::Unspecified => {
+            Some((0, 0, INTERVAL_COMPONENT_OPEN, INTERVAL_NO_ZONE))
+        }
+        Component::Unknown => Some((0, 0, INTERVAL_COMPONENT_UNKNOWN, INTERVAL_NO_ZONE)),
+        Component::Finite(f) => {
+            if f.frac_len > 9 {
+                return None;
             }
-            Component::Unknown => Some((0, 0, INTERVAL_COMPONENT_UNKNOWN, INTERVAL_NO_ZONE)),
-            Component::Finite(f) => {
-                if f.frac_len > 9 {
-                    return None;
-                }
-                let (secs, nanos, leap) = finite_posix_nanos(f);
-                let secs = if leap { secs.saturating_add(1) } else { secs };
-                let component_type = if f.kind == KIND_DATE {
-                    INTERVAL_COMPONENT_DATE
-                } else {
-                    INTERVAL_COMPONENT_DATETIME
-                };
-                let tz = match f.tz_class {
-                    TZ_ZONELESS => INTERVAL_NO_ZONE,
-                    TZ_Z => 0,
-                    _ => f.offset_minutes,
-                };
-                Some((secs, nanos, component_type, tz))
-            }
+            let (secs, nanos, leap) = finite_posix_nanos(f);
+            let secs = if leap { secs.saturating_add(1) } else { secs };
+            let component_type = if f.kind == KIND_DATE {
+                INTERVAL_COMPONENT_DATE
+            } else {
+                INTERVAL_COMPONENT_DATETIME
+            };
+            let tz = match f.tz_class {
+                TZ_ZONELESS => INTERVAL_NO_ZONE,
+                TZ_Z => 0,
+                _ => f.offset_minutes,
+            };
+            Some((secs, nanos, component_type, tz))
         }
     }
-    let (start_seconds, start_nanos, start_type, start_tz) = legacy_component_of(&iv.start)?;
-    let (end_seconds, end_nanos, end_type, end_tz) = legacy_component_of(&iv.end)?;
-
-    // The period string is the supplied canonical for duration forms, the
-    // derived period for explicit pairs.
-    let period = match iv.flag {
-        FLAG_START_DURATION => iv.canonical.split('/').nth(1).unwrap_or("PT0S").to_string(),
-        FLAG_DURATION_END => iv.canonical.split('/').next().unwrap_or("PT0S").to_string(),
-        _ => derived_period(iv),
-    };
-    let duration = parse_iso_duration(&period).unwrap_or(Duration {
-        sign: 0,
-        year: 0,
-        month: 0,
-        day: 0,
-        hour: 0,
-        minute: 0,
-        second: 0.0,
-    });
-
-    Some(DateTimeInterval {
-        start_seconds,
-        start_nanos,
-        end_seconds,
-        end_nanos,
-        start_type,
-        end_type,
-        flag: iv.flag,
-        duration,
-        start_tz,
-        end_tz,
-    })
 }
 
 impl TypedDict {
@@ -2014,17 +2148,24 @@ impl Bound {
 /// exactly one of two consecutive intervals.
 pub fn interval_relation(a: &LexicalInterval, rel: AllenRelation, b: &LexicalInterval) -> bool {
     use AllenRelation::*;
+    let (as_, ae) = (Bound::start(&a.start), Bound::end(&a.end));
+    let (bs, be) = (Bound::start(&b.start), Bound::end(&b.end));
     match rel {
+        // Point operand [t,t): on-or-after — an interval starting at the
+        // instant counts, as the point belongs to the interval it starts.
+        After if Bound::eq(&bs, &be) => return Bound::le(&be, &as_),
         After => return interval_relation(b, Before, a),
         MetBy => return interval_relation(b, Meets, a),
         OverlappedBy => return interval_relation(b, Overlaps, a),
         StartedBy => return interval_relation(b, Starts, a),
-        Contains => return interval_relation(b, During, a),
+        // Point operand delegates to during's start-inclusive arm; other
+        // operands get coverage semantics — a boundary-sharing span still
+        // counts as contained ("covers", not strict Allen-during).
+        Contains if Bound::eq(&bs, &be) => return interval_relation(b, During, a),
+        Contains => return Bound::le(&as_, &bs) && Bound::le(&be, &ae),
         FinishedBy => return interval_relation(b, Finishes, a),
         _ => {}
     }
-    let (as_, ae) = (Bound::start(&a.start), Bound::end(&a.end));
-    let (bs, be) = (Bound::start(&b.start), Bound::end(&b.end));
     match rel {
         Equals => Bound::eq(&as_, &bs) && Bound::eq(&ae, &be),
         Before => Bound::lt(&ae, &bs),
@@ -2107,9 +2248,7 @@ pub fn literal_relation_bounds(
 /// decode structurally; date and date-time entries render and coerce to the
 /// zero-duration point at their instant. Other datatypes have no interval
 /// reading and return `None`.
-pub fn entry_relation_bounds(
-    entry: &super::typed::TypedDictEntry,
-) -> Option<LexicalInterval> {
+pub fn entry_relation_bounds(entry: &super::typed::TypedDictEntry) -> Option<LexicalInterval> {
     use super::datatypes::Datatype;
     let lexical: String = match entry.datatype() {
         Datatype::DateTimeInterval => {
@@ -2123,7 +2262,13 @@ pub fn entry_relation_bounds(
                 INTERVAL_ENCODED_WIDTH => Some(legacy_interval_to_lexical(
                     &DateTimeInterval::from_lexical(bytes),
                 )),
-                _ => decode_lexical_entry(&bytes).ok(),
+                // A typed entry that fails decode is corrupt or of an unknown
+                // format — never a legitimate "no reading" (`None` would
+                // silently drop it from relation scans).
+                _ => Some(
+                    decode_lexical_entry(&bytes)
+                        .expect("undecodable dateTimeInterval dictionary entry"),
+                ),
             };
         }
         Datatype::DateTime => entry.as_val::<chrono::NaiveDateTime, String>(),
@@ -2131,7 +2276,11 @@ pub fn entry_relation_bounds(
         Datatype::Date => entry.as_val::<super::datatypes::Date, String>(),
         _ => return None,
     };
-    literal_relation_bounds(&lexical, entry.datatype()).ok()
+    // Same split: `None` means "no interval reading", a parse failure on a
+    // typed temporal entry is corruption and must not silently drop results.
+    literal_relation_bounds(&lexical, entry.datatype())
+        .map(Some)
+        .expect("unparseable stored temporal literal")
 }
 
 #[cfg(test)]
@@ -3222,6 +3371,21 @@ mod tests {
         );
     }
 
+    /// The expression is the value: equal durations with different
+    /// denominations are different literals and must encode differently —
+    /// `P2W`/`P14D` and `P0D`/`PT0S` never collapse.
+    #[test]
+    fn equal_durations_with_different_spellings_encode_differently() {
+        for (a, b) in [
+            ("2025-01-01/P0D", "2025-01-01/PT0S"),
+            ("P0D/2025-01-01", "PT0S/2025-01-01"),
+            ("P2W/2025-01-01", "P14D/2025-01-01"),
+            ("2025-01-01/P2W", "2025-01-01/P14D"),
+        ] {
+            assert_ne!(entry(a), entry(b), "{a} vs {b}");
+        }
+    }
+
     // -- front-coding / delta efficacy -----------------------------------------
 
     /// Measure the dictionary front-coding on a realistic common case: many
@@ -3526,7 +3690,10 @@ mod tests {
         ));
         // the single-date point renders back as the supplied single date
         assert_eq!(render_lexical_interval(&day), "2025-02-01");
-        assert_eq!(render_lexical_interval(&day_interval), "2025-02-01/2025-02-01");
+        assert_eq!(
+            render_lexical_interval(&day_interval),
+            "2025-02-01/2025-02-01"
+        );
         // the point sorting: i1, t, i2 — a point at a meeting boundary belongs
         // to the interval it starts
         let s = literal_as_interval("2025-01-01T00:00:00Z").unwrap();
@@ -3556,6 +3723,36 @@ mod tests {
     }
 
     #[test]
+    fn allen_relations_as_of_point_and_coverage() {
+        use AllenRelation::*;
+        // Quarterly spans as stored: half-open [start, end).
+        let q1 = parse_lexical_interval("2025-01-01T00:00:00Z/2025-04-01T00:00:00Z").unwrap();
+        let q2 = parse_lexical_interval("2025-04-01T00:00:00Z/2025-07-01T00:00:00Z").unwrap();
+        let q3 = parse_lexical_interval("2025-07-01T00:00:00Z/2025-10-01T00:00:00Z").unwrap();
+        // Bare date coerces to the as-of point at day-start.
+        let t = literal_as_interval("2025-04-01").unwrap();
+        // after on a point is on-or-after: the interval starting at the
+        // instant counts, along with every later one.
+        assert!(!interval_relation(&q1, After, &t));
+        assert!(interval_relation(&q2, After, &t));
+        assert!(interval_relation(&q3, After, &t));
+        // non-point reference stays strict Allen-after
+        assert!(!interval_relation(&q2, After, &q1));
+        // contains on a point reference stays end-exclusive: the seam
+        // instant belongs to the interval it starts, not the one it ends.
+        assert!(!interval_relation(&q1, Contains, &t));
+        assert!(interval_relation(&q2, Contains, &t));
+        // contains on a non-point reference is coverage: the whole day
+        // sharing q2's start counts as contained.
+        let day = parse_lexical_interval("2025-04-01/2025-04-01").unwrap();
+        assert!(interval_relation(&q2, Contains, &day));
+        assert!(!interval_relation(&q1, Contains, &day));
+        assert!(!interval_relation(&q3, Contains, &day));
+        // strict during is untouched: shared start is still not inside.
+        assert!(!interval_relation(&day, During, &q2));
+    }
+
+    #[test]
     fn allen_relations_special_endpoints() {
         use AllenRelation::*;
         let a = parse_lexical_interval("2025-01-01T00:00:00Z/2025-04-01T00:00:00Z").unwrap();
@@ -3580,5 +3777,139 @@ mod tests {
         // two unknowns never equal
         let unk2 = parse_lexical_interval("/2025-06-01").unwrap();
         assert!(!interval_relation(&unk, Equals, &unk2));
+    }
+
+    // -- parts-based marshal helpers ------------------------------------------
+    //
+    // `lexical_interval_from_parts`/`duration_parts_to_period`/`period_to_parts`
+    // are the boundary between the Prolog `duration/7` term shape and the
+    // lexical entry: components arrive as fixed-width tuples but the period is
+    // a canonical string, so day counts past the legacy `u8` marshal through.
+
+    #[test]
+    fn duration_parts_to_period_canonical_spellings() {
+        // zero is PT0S — the maximum-precision canonical, which the
+        // stored spelling must match for dictionary identity
+        assert_eq!("PT0S", duration_parts_to_period(1, 0, 0, 0, 0, 0, 0, "0"));
+        assert_eq!(
+            "P273D",
+            duration_parts_to_period(1, 0, 0, 0, 273, 0, 0, "0")
+        );
+        assert_eq!(
+            "P5000000000000D",
+            duration_parts_to_period(1, 0, 0, 0, 5_000_000_000_000, 0, 0, "0")
+        );
+        assert_eq!(
+            "-P1Y2M3DT4H5M6.5S",
+            duration_parts_to_period(-1, 0, 1, 2, 3, 4, 5, "6.5")
+        );
+        // supplied fraction precision is part of the canonical spelling
+        assert_eq!(
+            "PT1.50S",
+            duration_parts_to_period(1, 0, 0, 0, 0, 0, 0, "1.50")
+        );
+        assert_eq!(
+            "PT0.0000000000000000000000000000000000000000001S",
+            duration_parts_to_period(
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                "0.0000000000000000000000000000000000000000001"
+            )
+        );
+        // seconds of zero render absent however they are spelled
+        assert_eq!(
+            "PT0S",
+            duration_parts_to_period(1, 0, 0, 0, 0, 0, 0, "0.00")
+        );
+        assert_eq!("P1Y", duration_parts_to_period(1, 0, 1, 0, 0, 0, 0, "0.0"));
+        // ISO week form is exclusive — its own denomination, never days
+        assert_eq!("P2W", duration_parts_to_period(1, 2, 0, 0, 0, 0, 0, "0"));
+        assert_eq!("-P3W", duration_parts_to_period(-1, 3, 0, 0, 0, 0, 0, "0"));
+    }
+
+    #[test]
+    fn period_to_parts_round_trips() {
+        for s in [
+            "PT0S",
+            "P273D",
+            "-P1Y2M3DT4H5M6.5S",
+            "PT1.50S",
+            "P1M",
+            "PT1S",
+            "P2W",
+            "-P14W",
+        ] {
+            let (sign, w, y, mo, d, h, mi, sec) = period_to_parts(s).unwrap();
+            assert_eq!(s, duration_parts_to_period(sign, w, y, mo, d, h, mi, &sec));
+        }
+        // `P0D` is a valid input spelling; it canonicalises to `PT0S`
+        let (sign, w, y, mo, d, h, mi, sec) = period_to_parts("P0D").unwrap();
+        assert_eq!(
+            "PT0S",
+            duration_parts_to_period(sign, w, y, mo, d, h, mi, &sec)
+        );
+        assert_eq!(
+            (1, 0, 0, 0, 0, 0, 0, "0".to_string()),
+            period_to_parts("P0D").unwrap()
+        );
+        assert_eq!(
+            (1, 2, 0, 0, 0, 0, 0, "0".to_string()),
+            period_to_parts("P2W").unwrap()
+        );
+        for bad in ["P", "PT", "Q1D", "P1Y1", "PT1.2.3S", "P1Y2W", "PW", ""] {
+            assert!(period_to_parts(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn lexical_interval_from_parts_matches_legacy_encode() {
+        let iv = DateTimeInterval {
+            start_seconds: 1_737_417_600,
+            start_nanos: 0,
+            end_seconds: 1_737_504_000,
+            end_nanos: 0,
+            start_type: INTERVAL_COMPONENT_DATETIME,
+            end_type: INTERVAL_COMPONENT_DATETIME,
+            flag: FLAG_EXPLICIT,
+            duration: Duration::ZERO,
+            start_tz: 0,
+            end_tz: 0,
+        };
+        let want = encode_lexical_interval(&legacy_interval_to_lexical(&iv));
+        let got = encode_lexical_interval(&lexical_interval_from_parts(
+            (iv.start_seconds, iv.start_nanos, iv.start_type, iv.start_tz),
+            (iv.end_seconds, iv.end_nanos, iv.end_type, iv.end_tz),
+            iv.flag,
+            "",
+        ));
+        assert_eq!(want, got);
+    }
+
+    #[test]
+    fn lexical_interval_from_parts_stores_wide_periods() {
+        // the marshal path a 273-day WOQL reference takes — the period is a
+        // canonical string, so no component-width cap applies
+        let iv = lexical_interval_from_parts(
+            (1_737_417_600, 0, INTERVAL_COMPONENT_DATETIME, 0),
+            (0, 0, INTERVAL_COMPONENT_UNKNOWN, INTERVAL_NO_ZONE),
+            INTERVAL_FLAG_START_DURATION,
+            "P300D",
+        );
+        assert_eq!("20250121T000000Z/P300D", iv.canonical);
+        let decoded = decode_lexical_entry(&encode_lexical_interval(&iv)).unwrap();
+        assert_eq!(decoded.canonical, iv.canonical);
+
+        let big = lexical_interval_from_parts(
+            (1_737_417_600, 0, INTERVAL_COMPONENT_DATETIME, 0),
+            (0, 0, INTERVAL_COMPONENT_UNKNOWN, INTERVAL_NO_ZONE),
+            INTERVAL_FLAG_START_DURATION,
+            &duration_parts_to_period(1, 0, 0, 0, 5_000_000_000_000, 0, 0, "0"),
+        );
+        assert!(big.canonical.ends_with("/P5000000000000D"));
     }
 }
