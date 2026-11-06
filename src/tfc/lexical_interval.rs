@@ -147,6 +147,11 @@ fn leap_instant_to_naive(s: i64) -> (chrono::NaiveDateTime, bool) {
 pub const FLAG_EXPLICIT: u8 = 0; // T/T
 pub const FLAG_START_DURATION: u8 = 1; // T/P
 pub const FLAG_DURATION_END: u8 = 2; // P/T
+/// Single-component literal: a bare dateTime instant `[t,t)`, or a bare
+/// ISO date covering its whole day `[D, D+1)`. Distinct from
+/// `FLAG_EXPLICIT` at equal bounds — the entry keeps the supplied
+/// single-component spelling.
+pub const FLAG_POINT: u8 = 3; // T
 
 // -- errors -------------------------------------------------------------------
 
@@ -539,23 +544,25 @@ pub fn parse_lexical_interval(s: &str) -> Result<LexicalInterval, LexicalInterva
     let slash = match s.find('/') {
         Some(i) => i,
         None => {
-            // A bare finite component is an as-of instant: a date anchors at
-            // local day-start, a dateTime at itself. Encode the point [t,t)
-            // as a datetime pair so the inclusive-day rule for date ends
-            // does not stretch it into a whole day; the canonical spelling
-            // renders back as the single supplied form.
+            // A bare finite component is a single-instant literal, stored
+            // under FLAG_POINT so it stays distinct from an explicit pair
+            // at equal bounds. A bare dateTime is the as-of point [t,t); a
+            // bare ISO date is the duration of the day — the same interval
+            // as the explicit `D/D` pair (XBRL CSV / XBRL 2.1).
             let f = match parse_component(s, false)? {
-                Component::Finite(f) => FiniteComponent {
-                    kind: KIND_DATETIME,
-                    canonical: canonicalise_component(s),
-                    ..f
-                },
+                Component::Finite(f) => f,
                 _ => return Err(IntervalParseError::MissingSeparator(s.to_string()).into()),
             };
+            let end = if f.kind == KIND_DATE {
+                // is_end bumps the date to the next day's midnight
+                Component::Finite(parse_finite(s, true)?)
+            } else {
+                Component::Finite(f.clone())
+            };
             return Ok(LexicalInterval {
-                start: Component::Finite(f.clone()),
-                end: Component::Finite(f),
-                flag: FLAG_EXPLICIT,
+                start: Component::Finite(f),
+                end,
+                flag: FLAG_POINT,
                 canonical: canonicalise_component(s),
             });
         }
@@ -972,7 +979,7 @@ pub fn derived_period(iv: &LexicalInterval) -> String {
 /// interchangeable), the derived canonical period for `T/T`, empty when no
 /// finite pair exists (all-special intervals).
 fn period_key(iv: &LexicalInterval) -> String {
-    if iv.flag == FLAG_EXPLICIT {
+    if iv.flag == FLAG_EXPLICIT || iv.flag == FLAG_POINT {
         return derived_period(iv);
     }
     let (l, r) = iv.canonical.split_once('/').unwrap_or((&iv.canonical, ""));
@@ -1094,6 +1101,46 @@ pub fn encode_lexical_interval(iv: &LexicalInterval) -> Vec<u8> {
     out.to_vec()
 }
 
+/// Semantic order of two intervals by their bounds alone: the start then end
+/// class+instant fields, exactly as the entry's leading key bytes order them.
+/// Spelling fields — kind, timeshift, supplied precision, flag — and the
+/// derived period take no part, so literals denoting the same interval under
+/// different spellings (a date pair vs its zoneless datetime twin, a point vs
+/// the equal-bound pair) compare `Equal`.
+pub fn cmp_interval_bounds(a: &LexicalInterval, b: &LexicalInterval) -> std::cmp::Ordering {
+    cmp_component_bound(&a.start, &b.start, true)
+        .then_with(|| cmp_component_bound(&a.end, &b.end, false))
+}
+
+/// Class then instant, the same two fields `component_instant_key` encodes —
+/// computed field-wise so per-object comparisons allocate nothing.
+fn cmp_component_bound(a: &Component, b: &Component, is_start: bool) -> std::cmp::Ordering {
+    a.class_byte(is_start).cmp(&b.class_byte(is_start)).then_with(|| {
+        match (a, b) {
+            (Component::Finite(fa), Component::Finite(fb)) => cmp_finite_instant(fa, fb),
+            _ => std::cmp::Ordering::Equal,
+        }
+    })
+}
+
+/// Instant order identical to `integer_and_fraction_to_storage`. `int` is a
+/// signed ceiling (`-1.5 → int=-1, frac="5"`), so it compares in its own
+/// right; `is_neg` only breaks the `±0.x` int tie. A missing frac is the
+/// empty string — `""` sorts first for positives and last for negatives,
+/// whose frac counts down, giving `-1.5 < -1.0 < 0.0`.
+fn cmp_finite_instant(a: &FiniteComponent, b: &FiniteComponent) -> std::cmp::Ordering {
+    a.is_neg
+        .cmp(&b.is_neg)
+        .reverse()
+        .then_with(|| a.int.cmp(&b.int))
+        .then_with(|| {
+            let fa = a.frac.as_deref().unwrap_or("");
+            let fb = b.frac.as_deref().unwrap_or("");
+            let c = fa.cmp(fb);
+            if a.is_neg { c.reverse() } else { c }
+        })
+}
+
 /// Instant part only (int + fraction). kind/timeshift live later in the
 /// entry — `decode_meta` fills them for finite components.
 fn decode_finite(bytes: &mut &[u8]) -> Result<FiniteComponent, LexicalIntervalError> {
@@ -1213,11 +1260,17 @@ pub fn decode_lexical_entry(bytes: &[u8]) -> Result<LexicalInterval, LexicalInte
         component_canonical(&start, false),
         component_canonical(&end, true),
     );
-    let canonical = format!(
-        "{}/{}",
-        period_side(true).unwrap_or(cs.clone()),
-        period_side(false).unwrap_or(ce.clone())
-    );
+    let canonical = if flag == FLAG_POINT {
+        // single-component literal: the canonical is the supplied
+        // instant/date spelling alone
+        cs.clone()
+    } else {
+        format!(
+            "{}/{}",
+            period_side(true).unwrap_or(cs.clone()),
+            period_side(false).unwrap_or(ce.clone())
+        )
+    };
     for (c, s) in [(&mut start, cs), (&mut end, ce)] {
         if let Component::Finite(f) = c {
             f.canonical = s;
@@ -1240,21 +1293,8 @@ pub fn render_lexical_interval(iv: &LexicalInterval) -> String {
         return extend_component(&iv.canonical);
     }
     let (l, r) = iv.canonical.split_once('/').unwrap_or((&iv.canonical, ""));
-    if iv.flag == FLAG_EXPLICIT && iv.start == iv.end {
-        if let Component::Finite(f) = &iv.start {
-            // A zoneless [t,t) is the as-of point spelling — the entry cannot
-            // distinguish a supplied pair from a bare component, and the
-            // value is the same instant either way. A day-aligned instant is
-            // the bare date. Zoned points keep the pair spelling.
-            if f.tz_class == TZ_ZONELESS {
-                let side = extend_component(l);
-                return match side.strip_suffix("T00:00:00") {
-                    Some(date) => date.to_string(),
-                    None => side,
-                };
-            }
-        }
-    }
+    // Single-component spellings are carried by FLAG_POINT entries (handled
+    // above); an explicit T/T pair keeps both sides even at equal instants.
     let render_side = |side: &str, c: &Component| match c {
         Component::Finite(_) => extend_component(side),
         _ => c.canonical_str().to_string(),
@@ -1836,6 +1876,7 @@ pub fn lexical_interval_from_parts(
     let s = legacy_component(start.0, start.1, start.2, start.3, false);
     let e = legacy_component(end.0, end.1, end.2, end.3, true);
     let canonical = match flag {
+        FLAG_POINT => component_canonical(&s, false),
         INTERVAL_FLAG_DURATION_END => {
             format!("{}/{}", period, component_canonical(&e, true))
         }
@@ -2049,8 +2090,9 @@ impl std::str::FromStr for AllenRelation {
 }
 
 /// Parse a literal as an interval; a bare instant literal coerces to the
-/// zero-duration point interval `[t, t)` so `dateTime` operands work under
-/// Allen relations.
+/// zero-duration point interval `[t, t)` and a bare date to its whole day
+/// `[D, D+1)`, so `dateTime` and `date` operands work under Allen
+/// relations.
 pub fn literal_as_interval(s: &str) -> Result<LexicalInterval, LexicalIntervalError> {
     parse_lexical_interval(s).or_else(|_| parse_lexical_interval(&format!("{s}/{s}")))
 }
@@ -2699,6 +2741,116 @@ mod tests {
             let dec = decode_lexical_entry(&enc).unwrap();
             assert_eq!(dec.canonical, iv.canonical, "{s}");
             assert_eq!(render_lexical_interval(&dec), s, "{s}");
+        }
+    }
+
+    // -- single-component spellings ---------------------------------------------
+
+    /// A bare ISO date denotes the duration of the day (XBRL CSV / XBRL 2.1):
+    /// the same interval as the explicit `D/D` pair — while keeping the
+    /// supplied single spelling as its canonical.
+    #[test]
+    fn bare_date_is_the_whole_day() {
+        let day = parse_lexical_interval("2025-02-01").unwrap();
+        let pair = parse_lexical_interval("2025-02-01/2025-02-01").unwrap();
+        assert_eq!(day.start, pair.start);
+        assert_eq!(day.end, pair.end);
+        assert!(interval_relation(&day, AllenRelation::Equals, &pair));
+        assert!(!day.canonical.contains('/'));
+        let dec = decode_lexical_entry(&encode_lexical_interval(&day)).unwrap();
+        assert_eq!(render_lexical_interval(&dec), "2025-02-01");
+    }
+
+    /// A bare ISO dateTime is the as-of instant `[t,t)`, spelled and
+    /// rendered as the supplied single timestamp — zoned, `Z`, and local.
+    #[test]
+    fn bare_datetime_is_an_instant() {
+        for s in [
+            "2025-03-15T00:00:00+02:00",
+            "2025-03-15T00:00:00Z",
+            "2025-03-15T00:00:00",
+            "2025-03-15T12:30:45.5Z",
+        ] {
+            let iv = parse_lexical_interval(s).unwrap();
+            assert_eq!(iv.start, iv.end, "{s}");
+            let dec = decode_lexical_entry(&encode_lexical_interval(&iv)).unwrap();
+            assert_eq!(render_lexical_interval(&dec), s);
+        }
+    }
+
+    /// Zero duration is only the explicit pair spelling: a supplied `T/T`
+    /// keeps both endpoints on the way back out — the single-component
+    /// render belongs to the distinct bare-instant literal.
+    #[test]
+    fn explicit_zero_length_pairs_render_as_pairs() {
+        for s in [
+            "2025-02-01T00:00:00/2025-02-01T00:00:00",
+            "2025-02-01T00:00:00Z/2025-02-01T00:00:00Z",
+            "2025-03-15T00:00:00+02:00/2025-03-15T00:00:00+02:00",
+        ] {
+            let iv = parse_lexical_interval(s).unwrap();
+            let dec = decode_lexical_entry(&encode_lexical_interval(&iv)).unwrap();
+            assert_eq!(render_lexical_interval(&dec), s);
+        }
+    }
+
+    /// Bound comparison ignores spelling: literals denoting the same
+    /// interval under different spellings compare `Equal`, while a
+    /// genuinely different interval still orders chronologically.
+    #[test]
+    fn bound_cmp_equates_spellings_not_intervals() {
+        use std::cmp::Ordering;
+        let iv = |s: &str| parse_lexical_interval(s).unwrap();
+        // same bounds, different spellings
+        assert_eq!(
+            Ordering::Equal,
+            cmp_interval_bounds(&iv("2025-01-01/2025-03-31"), &iv("2025-01-01T00:00:00/2025-04-01T00:00:00"))
+        );
+        assert_eq!(
+            Ordering::Equal,
+            cmp_interval_bounds(&iv("2025-01-01/2025-03-31"), &iv("2025-01-01T00:00:00Z/2025-04-01T00:00:00Z"))
+        );
+        assert_eq!(
+            Ordering::Equal,
+            cmp_interval_bounds(&iv("2026-10-01"), &iv("2026-10-01/2026-10-01"))
+        );
+        assert_eq!(
+            Ordering::Equal,
+            cmp_interval_bounds(&iv("2025-03-15T00:00:00Z"), &iv("2025-03-15T00:00:00Z/2025-03-15T00:00:00Z"))
+        );
+        // a duration-derived end resolves to the same bounds
+        assert_eq!(
+            Ordering::Equal,
+            cmp_interval_bounds(&iv("2025-01-01/P3M"), &iv("2025-01-01/2025-03-31"))
+        );
+        // open and unknown endpoint classes round-trip through the classes
+        assert_eq!(
+            Ordering::Equal,
+            cmp_interval_bounds(&iv("2025-01-01/.."), &iv("2025-01-01/.."))
+        );
+        assert_eq!(
+            Ordering::Equal,
+            cmp_interval_bounds(&iv("2025-01-01/"), &iv("2025-01-01/"))
+        );
+        // real differences still order by instant
+        assert_eq!(
+            Ordering::Less,
+            cmp_interval_bounds(&iv("2025-01-01/2025-03-31"), &iv("2025-04-01/2025-06-30"))
+        );
+        assert_eq!(
+            Ordering::Less,
+            cmp_interval_bounds(&iv("2025-01-01/2025-03-31"), &iv("2025-01-01/2025-06-30"))
+        );
+        // negative instants: signed ceiling int orders, and the frac counts
+        // down — -0.9 < -0.5 < -0.0 — the same order
+        // integer_and_fraction_to_storage encodes
+        for (a, b) in [
+            ("1959-02-01/1959-02-28", "1959-03-01/1959-03-31"),
+            ("1969-12-31T23:59:58.5Z/1970-01-01", "1969-12-31T23:59:59Z/1970-01-01"),
+            ("1969-12-31T23:59:59.1Z/1970-01-01", "1969-12-31T23:59:59.5Z/1970-01-01"),
+        ] {
+            assert_eq!(Ordering::Less, cmp_interval_bounds(&iv(a), &iv(b)), "{a} < {b}");
+            assert_eq!(Ordering::Greater, cmp_interval_bounds(&iv(b), &iv(a)), "{b} > {a}");
         }
     }
 
@@ -3676,11 +3828,10 @@ mod tests {
         let p = literal_as_interval("2025-02-01T00:00:00Z").unwrap();
         assert!(interval_relation(&p, During, &a));
         assert!(interval_relation(&a, Contains, &p));
-        // a bare `date` literal coerces to the as-of point at local
-        // day-start — [t,t) — while the explicit pair `date/date` keeps the
-        // whole local day
+        // a bare `date` literal is the whole local day — the same interval
+        // as the explicit `date/date` pair, spelled as the single date
         let day = literal_as_interval("2025-02-01").unwrap();
-        assert!(Bound::eq(&Bound::start(&day.start), &Bound::end(&day.end)));
+        assert!(!Bound::eq(&Bound::start(&day.start), &Bound::end(&day.end)));
         assert!(interval_relation(&day, During, &a));
         assert!(interval_relation(&a, Contains, &day));
         let day_interval = parse_lexical_interval("2025-02-01/2025-02-01").unwrap();
@@ -3688,7 +3839,9 @@ mod tests {
             &Bound::start(&day_interval.start),
             &Bound::end(&day_interval.end)
         ));
-        // the single-date point renders back as the supplied single date
+        // bare date and explicit pair are the same interval, spelled apart
+        assert!(interval_relation(&day, Equals, &day_interval));
+        // the single date renders back as the supplied single date
         assert_eq!(render_lexical_interval(&day), "2025-02-01");
         assert_eq!(
             render_lexical_interval(&day_interval),
@@ -3729,22 +3882,23 @@ mod tests {
         let q1 = parse_lexical_interval("2025-01-01T00:00:00Z/2025-04-01T00:00:00Z").unwrap();
         let q2 = parse_lexical_interval("2025-04-01T00:00:00Z/2025-07-01T00:00:00Z").unwrap();
         let q3 = parse_lexical_interval("2025-07-01T00:00:00Z/2025-10-01T00:00:00Z").unwrap();
-        // Bare date coerces to the as-of point at day-start.
+        // A bare date is the whole day [Apr 1, Apr 2) — the same interval
+        // as the explicit pair, spelled as the single date.
         let t = literal_as_interval("2025-04-01").unwrap();
-        // after on a point is on-or-after: the interval starting at the
-        // instant counts, along with every later one.
+        let day = parse_lexical_interval("2025-04-01/2025-04-01").unwrap();
+        assert!(interval_relation(&t, Equals, &day));
+        // after stays strict: q2 shares Apr 1 with the day interval, so it
+        // is not strictly after it; q3 remains after.
         assert!(!interval_relation(&q1, After, &t));
-        assert!(interval_relation(&q2, After, &t));
+        assert!(!interval_relation(&q2, After, &t));
         assert!(interval_relation(&q3, After, &t));
         // non-point reference stays strict Allen-after
         assert!(!interval_relation(&q2, After, &q1));
-        // contains on a point reference stays end-exclusive: the seam
-        // instant belongs to the interval it starts, not the one it ends.
+        // contains is coverage: the day interval sits inside q2 (shared
+        // start), outside the quarters it does not overlap.
         assert!(!interval_relation(&q1, Contains, &t));
         assert!(interval_relation(&q2, Contains, &t));
-        // contains on a non-point reference is coverage: the whole day
-        // sharing q2's start counts as contained.
-        let day = parse_lexical_interval("2025-04-01/2025-04-01").unwrap();
+        // same for the identically bounded explicit pair.
         assert!(interval_relation(&q2, Contains, &day));
         assert!(!interval_relation(&q1, Contains, &day));
         assert!(!interval_relation(&q3, Contains, &day));

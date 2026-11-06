@@ -1,0 +1,11 @@
+[package]
+name = "tdb-datetime"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "fixed-format ISO 8601 date/time parsing at TerminusDB storage resolution"
+repository = "https://github.com/terminusdb-labs/tdb-succinct"
+
+[dev-dependencies]
+chrono = "0.4.34"
+rug = { version = ">=1.16, <2.0", default-features = false, features = ["integer"] }
