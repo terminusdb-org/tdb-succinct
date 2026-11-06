@@ -1,6 +1,6 @@
 [package]
 name = "tdb-succinct"
-version = "0.2.0"
+version = "0.2.1"
 authors = [
     "Philippe Höij <philippe@hoij.net>",
     "Matthijs van Otterdijk <matthijs@terminusdb.com>",
@@ -14,7 +14,11 @@ repository = "https://github.com/terminusdb-labs/tdb-succinct"
 documentation = "https://docs.rs/tdb-succinct/"
 exclude = [".gitignore", ".github/", "/ci/"]
 
+[workspace]
+members = ["tdb-datetime"]
+
 [dependencies]
+tdb-datetime = { path = "tdb-datetime" }
 async-trait = "0.1.77"
 base64 = "0.21.7"
 bitvec = "1.0.1"

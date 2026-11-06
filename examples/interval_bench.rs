@@ -31,6 +31,14 @@ const VARIANTS: &[(&str, &str)] = &[
     ("date/date", "2025-01-01/2025-03-31"),
     ("date/period", "2025-01-01/P3M"),
     ("period/date", "P3M/2025-03-31"),
+    ("point date", "2025-02-01"),
+    ("point datetime Z", "2025-03-15T00:00:00Z"),
+    ("point datetime +02:00", "2025-03-15T00:00:00+02:00"),
+    ("point datetime local", "2025-03-15T00:00:00"),
+    (
+        "zero-length pair",
+        "2025-03-15T00:00:00/2025-03-15T00:00:00",
+    ),
 ];
 
 fn time<F: FnMut() -> R, R>(n: usize, mut f: F) -> u128 {
@@ -47,7 +55,7 @@ fn time<F: FnMut() -> R, R>(n: usize, mut f: F) -> u128 {
 // An instant is `secs + frac/10^len` seconds from the Unix epoch, where secs is
 // an arbitrary-precision integer (chrono's ~±262k-year calendar range does not
 // bound the ordering domain) and frac is an arbitrary-precision decimal digit
-// string (planck scale ~44 digits and beyond).
+// string (sub-Planck precision — up to 49 digits).
 //
 // Three representations are compared:
 //   Rational — rug::Rational (GMP mpq), canonicalised at construction.
@@ -85,30 +93,30 @@ const TIERS: &[(&str, Parts)] = &[
         },
     ),
     (
-        "planck44",
+        "planck49",
         Parts {
             is_neg: false,
             int: "1738233000",
-            frac_a: "00000000000000000000000000000000000000000539",
-            frac_b: "00000000000000000000000000000000000000000540",
+            frac_a: "0000000000000000000000000000000000000000053900000",
+            frac_b: "0000000000000000000000000000000000000000053900001",
         },
     ),
     (
-        "universe-age + frac44",
+        "universe-age + frac49",
         Parts {
             is_neg: false,
             int: "435000000000000000",
-            frac_a: "12345678901234567890123456789012345678901234",
-            frac_b: "12345678901234567890123456789012345678901235",
+            frac_a: "1234567890123456789012345678901234567890123456789",
+            frac_b: "1234567890123456789012345678901234567890123456790",
         },
     ),
     (
-        "deep-time 1e30 + frac44",
+        "deep-time 1e30 + frac49",
         Parts {
             is_neg: false,
             int: "1000000000000000000000000000000",
-            frac_a: "12345678901234567890123456789012345678901234",
-            frac_b: "12345678901234567890123456789012345678901235",
+            frac_a: "1234567890123456789012345678901234567890123456789",
+            frac_b: "1234567890123456789012345678901234567890123456790",
         },
     ),
     (
@@ -284,11 +292,35 @@ fn main() {
         println!();
     }
 
+    bound_cmp();
+
     rational_order();
 
     entry_composition();
 
     lexical_100k();
+}
+
+// Bound-equality compare cost: the leading class+instant fields against the
+// whole-entry byte compare. Used by filter ops, which must see every spelling
+// of the same period as the same interval.
+fn bound_cmp() {
+    use tdb_succinct::tfc::lexical_interval::cmp_interval_bounds;
+    let a = parse_lexical_interval("2025-01-01/2025-03-31").unwrap();
+    let b = parse_lexical_interval("2025-01-01T00:00:00/2025-04-01T00:00:00").unwrap();
+    let ea = encode_lexical_interval(&a);
+    let eb = encode_lexical_interval(&b);
+    const N: usize = 100_000;
+    let later = parse_lexical_interval("2025-04-01/2025-06-30").unwrap();
+    let bounds_eq = time(N, || {
+        cmp_interval_bounds(black_box(&a), black_box(&b))
+    }) / N as u128;
+    let bounds_lt = time(N, || {
+        cmp_interval_bounds(black_box(&a), black_box(&later))
+    }) / N as u128;
+    let bytes_eq = time(N, || black_box(&ea).cmp(black_box(&eb))) / N as u128;
+    println!("=== bound compare vs entry-byte compare ===");
+    println!("cmp_interval_bounds eq {bounds_eq} ns   lt {bounds_lt} ns   entry.cmp {bytes_eq} ns\n");
 }
 
 // ---------------------------------------------------------------------------
