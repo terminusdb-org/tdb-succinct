@@ -948,7 +948,12 @@ fn duration_string(duration: &Duration) -> String {
 impl FromLexical<Duration> for String {
     fn from_lexical<B: Buf>(b: B) -> Self {
         let duration = Duration::from_lexical(b);
-        duration_string(&duration)
+        let s = duration_string(&duration);
+        if duration.sign < 0 {
+            format!("-{s}")
+        } else {
+            s
+        }
     }
 }
 
@@ -2025,6 +2030,24 @@ mod tests {
         };
         let s = duration_string(&duration);
         assert_eq!("PT0.1S", s);
+    }
+
+    /// A stored negative duration renders its sign — `duration_string`
+    /// produces the magnitude, the lexical `String` conversion adds `-`.
+    #[test]
+    fn negative_duration_renders_sign() {
+        let duration = Duration {
+            sign: -1,
+            year: 0,
+            month: 0,
+            day: 1,
+            hour: 0,
+            minute: 0,
+            second: 0.0,
+        };
+        assert_eq!("P1D", duration_string(&duration));
+        let s = <String as FromLexical<Duration>>::from_lexical(duration.to_lexical());
+        assert_eq!("-P1D", s);
     }
 
     #[test]

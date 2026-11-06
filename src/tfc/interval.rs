@@ -15,6 +15,8 @@ use super::datatypes::{
     INTERVAL_FLAG_START_DURATION, INTERVAL_LEGACY_ENCODED_WIDTH, INTERVAL_NEG_INF,
     INTERVAL_NO_ZONE, INTERVAL_POS_INF, INTERVAL_UNKNOWN_END, INTERVAL_UNKNOWN_START,
 };
+use super::lexical_interval::{cmp_end_key, probe_key, EndKey};
+use std::cmp::Ordering;
 use super::typed::{TypedDict, TypedDictBufBuilder, TypedDictEntry};
 use crate::bitindex::BitIndex;
 use crate::logarray::{LogArray, LogArrayBufBuilder, LogArrayFileBuilder};
@@ -412,6 +414,132 @@ pub(crate) fn parse_iso_duration(s: &str) -> Result<Duration, IntervalParseError
     })
 }
 
+/// Full-resolution duration parts for interval arithmetic — the lexical
+/// duration contract (`/docs/xsd-duration/`): i128 components, exact decimal
+/// seconds as int+fraction digits, week folded into days for arithmetic only
+/// (the supplied spelling lives in the interval's period field).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PreciseDuration {
+    /// Always 1 here — `-` is rejected in interval position; the field exists
+    /// for the standalone `xsd:duration` parser.
+    pub sign: i8,
+    pub year: i128,
+    pub month: i128,
+    /// day count, weeks folded ×7 — a week IS exactly 7 days arithmetically.
+    pub day: i128,
+    pub hour: i128,
+    pub minute: i128,
+    pub sec_int: i128,
+    /// Fraction digits verbatim (≤49, the precision boundary).
+    pub sec_frac: Option<String>,
+}
+
+/// Parse `PnYnMnDTnHnMnS` / `PnW` at full `xsd:duration` resolution.
+pub(crate) fn parse_precise_duration(s: &str) -> Result<PreciseDuration, IntervalParseError> {
+    let err = || IntervalParseError::InvalidDuration(s.to_string());
+    // interval durations are non-negative periods — a `-` sign produces an
+    // inverted interval, which the grammar does not admit. The sign is only
+    // legal in a standalone `xsd:duration` literal.
+    if s.starts_with('-') {
+        return Err(err());
+    }
+    let sign = 1i8;
+    let rest = s.strip_prefix('P').ok_or_else(err)?;
+    let (date_part, time_part) = match rest.find('T') {
+        Some(t) => (&rest[..t], Some(&rest[t + 1..])),
+        None => (rest, None),
+    };
+    let big = |b: &str| b.parse::<i128>().map_err(|_| err());
+    let mut d = PreciseDuration {
+        sign,
+        year: 0,
+        month: 0,
+        day: 0,
+        hour: 0,
+        minute: 0,
+        sec_int: 0,
+        sec_frac: None,
+    };
+    let mut last: Option<DurationDesignator> = None;
+    let mut seen_week = false;
+    let mut num = String::new();
+    for ch in date_part.chars() {
+        match ch {
+            'Y' | 'M' | 'D' if seen_week => return Err(err()),
+            'Y' => {
+                validate_designator_order(&last, DurationDesignator::Year).map_err(|_| err())?;
+                last = Some(DurationDesignator::Year);
+                d.year = big(&num)?;
+            }
+            'M' => {
+                validate_designator_order(&last, DurationDesignator::Month).map_err(|_| err())?;
+                last = Some(DurationDesignator::Month);
+                d.month = big(&num)?;
+            }
+            'W' => {
+                if last.is_some() {
+                    return Err(err()); // W is the only date designator
+                }
+                last = Some(DurationDesignator::Week);
+                seen_week = true;
+                d.day = big(&num)?.checked_mul(7).ok_or_else(err)?;
+            }
+            'D' => {
+                validate_designator_order(&last, DurationDesignator::Day).map_err(|_| err())?;
+                last = Some(DurationDesignator::Day);
+                d.day = big(&num)?;
+            }
+            '0'..='9' => num.push(ch),
+            _ => return Err(err()),
+        }
+        if matches!(ch, 'Y' | 'M' | 'W' | 'D') {
+            num.clear();
+        }
+    }
+    if !num.is_empty() {
+        return Err(err());
+    }
+    let mut last: Option<DurationDesignator> = None;
+    let mut num = String::new();
+    for ch in time_part.unwrap_or("").chars() {
+        match ch {
+            'H' => {
+                validate_designator_order(&last, DurationDesignator::Hour).map_err(|_| err())?;
+                last = Some(DurationDesignator::Hour);
+                d.hour = big(&num)?;
+            }
+            'M' => {
+                validate_designator_order(&last, DurationDesignator::Minute).map_err(|_| err())?;
+                last = Some(DurationDesignator::Minute);
+                d.minute = big(&num)?;
+            }
+            'S' => {
+                validate_designator_order(&last, DurationDesignator::Second).map_err(|_| err())?;
+                last = Some(DurationDesignator::Second);
+                match num.split_once('.') {
+                    Some((i, f)) => {
+                        if f.is_empty() || f.len() > 49 || !f.chars().all(|c| c.is_ascii_digit()) {
+                            return Err(err());
+                        }
+                        d.sec_int = big(i)?;
+                        d.sec_frac = Some(f.to_string());
+                    }
+                    None => d.sec_int = big(&num)?,
+                }
+            }
+            '0'..='9' | '.' => num.push(ch),
+            _ => return Err(err()),
+        }
+        if matches!(ch, 'H' | 'M' | 'S') {
+            num.clear();
+        }
+    }
+    if !num.is_empty() || time_part == Some("") {
+        return Err(err());
+    }
+    Ok(d)
+}
+
 /// Compute an approximate duration from two endpoints.
 /// This produces a day-based duration (no month/year component).
 pub(crate) fn compute_duration_from_endpoints(
@@ -739,9 +867,189 @@ impl TypedDict {
 /// end_nanos)` keys; `tree` encodes each segment position's end rank.
 /// Positions are 0-based within the interval segment.
 #[derive(Clone)]
-pub struct IntervalEndIndex {
+struct RankedEndIndex {
     ends: LogArray,
     tree: WaveletTree,
+}
+
+/// Index on interval end timestamps: the same rank-table-plus-wavelet
+/// shape at two key widths — `(i64, u32)` for the file-backed form, the
+/// full-width `EndKey` domain for in-memory indexes over layers holding
+/// ends beyond it (sub-nanosecond fractions, out-of-i64 instants).
+#[derive(Clone)]
+pub struct IntervalEndIndex {
+    inner: EndIndexInner,
+}
+
+#[derive(Clone)]
+enum EndIndexInner {
+    Ranked(RankedEndIndex),
+    Wide(WideEndIndex),
+}
+
+/// The in-memory-only wide form: sorted distinct `EndKey`s, a rank per
+/// segment position, and a CSR position index (`perm`/`starts`) so rank
+/// windows enumerate positions directly. Probe bounds come from
+/// `partition_point` on the keys; semantics are identical to the ranked
+/// form, including the unknown/plus-infinity sentinel classes.
+#[derive(Clone)]
+struct WideEndIndex {
+    distinct: Vec<EndKey>,
+    /// Positions grouped by rank: rank `r` occupies
+    /// `perm[starts[r]..starts[r + 1]]`.
+    perm: Vec<u64>,
+    /// `distinct.len() + 1` offsets into `perm`.
+    starts: Vec<u64>,
+    /// Rank per segment position, in segment order.
+    ranks: Vec<u32>,
+}
+
+impl WideEndIndex {
+    fn build(keys: Vec<EndKey>) -> Self {
+        let mut distinct = keys.clone();
+        distinct.sort_by(cmp_end_key);
+        distinct.dedup_by(|a, b| cmp_end_key(a, b) == Ordering::Equal);
+        let mut ranks = Vec::with_capacity(keys.len());
+        for k in &keys {
+            ranks.push(distinct.partition_point(|d| cmp_end_key(d, k) == Ordering::Less) as u32);
+        }
+        let mut starts = vec![0u64; distinct.len() + 1];
+        for &r in &ranks {
+            starts[r as usize + 1] += 1;
+        }
+        for i in 0..distinct.len() {
+            starts[i + 1] += starts[i];
+        }
+        let mut perm = vec![0u64; keys.len()];
+        let mut cursor = starts.clone();
+        for (p, &r) in ranks.iter().enumerate() {
+            perm[cursor[r as usize] as usize] = p as u64;
+            cursor[r as usize] += 1;
+        }
+        WideEndIndex {
+            distinct,
+            perm,
+            starts,
+            ranks,
+        }
+    }
+}
+
+/// Probe bounds are implementation-specific, as is the rank-window →
+/// positions step; the `(secs, nanos)` → rank-window translation is shared
+/// here.
+trait EndRankIndex {
+    fn end_lower_bound(&self, secs: i64, nanos: u32) -> u64;
+    fn end_upper_bound(&self, secs: i64, nanos: u32) -> u64;
+    /// First rank above the unknown-end block: the NULL-semantics cut for
+    /// the `le`/`lt`/`range` family, whose ranges otherwise reach rank 0.
+    fn first_non_unknown_end_rank(&self) -> u64;
+    fn num_ranks(&self) -> u64;
+    /// Positions in `pos` whose end rank lies in `[r_lo, r_hi)`, ascending.
+    fn ranks_in_range(&self, pos: Range<u64>, r_lo: u64, r_hi: u64) -> Vec<u64>;
+
+    /// Segment positions in `pos` with `end <= (secs, nanos)`. Unknown ends
+    /// are excluded: an unspecified end satisfies no instant comparison.
+    fn positions_end_le(&self, pos: Range<u64>, secs: i64, nanos: u32) -> Vec<u64> {
+        self.ranks_in_range(
+            pos,
+            self.first_non_unknown_end_rank(),
+            self.end_upper_bound(secs, nanos),
+        )
+    }
+
+    /// Segment positions in `pos` with `end < (secs, nanos)`. Unknown ends
+    /// are excluded.
+    fn positions_end_lt(&self, pos: Range<u64>, secs: i64, nanos: u32) -> Vec<u64> {
+        self.ranks_in_range(
+            pos,
+            self.first_non_unknown_end_rank(),
+            self.end_lower_bound(secs, nanos),
+        )
+    }
+
+    /// Segment positions in `pos` with `end >= (secs, nanos)`.
+    fn positions_end_ge(&self, pos: Range<u64>, secs: i64, nanos: u32) -> Vec<u64> {
+        self.ranks_in_range(pos, self.end_lower_bound(secs, nanos), self.num_ranks())
+    }
+
+    /// Segment positions in `pos` with `end > (secs, nanos)`.
+    fn positions_end_gt(&self, pos: Range<u64>, secs: i64, nanos: u32) -> Vec<u64> {
+        self.ranks_in_range(pos, self.end_upper_bound(secs, nanos), self.num_ranks())
+    }
+
+    /// Segment positions in `pos` with `end == (secs, nanos)`.
+    fn positions_end_eq(&self, pos: Range<u64>, secs: i64, nanos: u32) -> Vec<u64> {
+        self.ranks_in_range(
+            pos,
+            self.end_lower_bound(secs, nanos),
+            self.end_upper_bound(secs, nanos),
+        )
+    }
+
+    /// Segment positions in `pos` with `end` in `[lo, hi]` inclusive.
+    /// Unknown ends are excluded.
+    fn positions_end_range(&self, pos: Range<u64>, lo: (i64, u32), hi: (i64, u32)) -> Vec<u64> {
+        self.ranks_in_range(
+            pos,
+            self.end_lower_bound(lo.0, lo.1)
+                .max(self.first_non_unknown_end_rank()),
+            self.end_upper_bound(hi.0, hi.1),
+        )
+    }
+}
+
+impl EndRankIndex for WideEndIndex {
+    fn end_lower_bound(&self, secs: i64, nanos: u32) -> u64 {
+        let probe = probe_key(secs, nanos);
+        self.distinct
+            .partition_point(|k| cmp_end_key(k, &probe) == Ordering::Less) as u64
+    }
+
+    fn end_upper_bound(&self, secs: i64, nanos: u32) -> u64 {
+        let probe = probe_key(secs, nanos);
+        self.distinct
+            .partition_point(|k| cmp_end_key(k, &probe) != Ordering::Greater) as u64
+    }
+
+    fn first_non_unknown_end_rank(&self) -> u64 {
+        self.distinct.partition_point(|k| matches!(k, EndKey::Below)) as u64
+    }
+
+    fn num_ranks(&self) -> u64 {
+        self.distinct.len() as u64
+    }
+
+    /// Two strategies, the same choice the wavelet makes but with the
+    /// primitives this layout exists for: a narrow rank window enumerates
+    /// its CSR blocks directly, a wide one scans `ranks` per position —
+    /// ascending order for free, no per-position decode.
+    fn ranks_in_range(&self, pos: Range<u64>, r_lo: u64, r_hi: u64) -> Vec<u64> {
+        let pos_hi = pos.end.min(self.ranks.len() as u64);
+        if r_lo >= r_hi || pos.start >= pos_hi {
+            return Vec::new();
+        }
+        if r_hi - r_lo <= pos_hi - pos.start {
+            let mut out = Vec::new();
+            for r in r_lo..r_hi {
+                for i in self.starts[r as usize]..self.starts[r as usize + 1] {
+                    let p = self.perm[i as usize];
+                    if p >= pos.start && p < pos_hi {
+                        out.push(p);
+                    }
+                }
+            }
+            out.sort_unstable();
+            out
+        } else {
+            (pos.start..pos_hi)
+                .filter(|&p| {
+                    let r = self.ranks[p as usize] as u64;
+                    r >= r_lo && r < r_hi
+                })
+                .collect()
+        }
+    }
 }
 
 /// Wavelet alphabet width needed to encode `n` distinct end ranks.
@@ -768,13 +1076,106 @@ fn interval_segment_ends(dict: &TypedDict) -> Vec<(i64, u32)> {
 
 impl IntervalEndIndex {
     pub fn from_parts(ends: LogArray, bits: BitIndex) -> Self {
-        let tree = WaveletTree::from_parts(bits, end_rank_width(ends.len() / 2));
-        IntervalEndIndex { ends, tree }
+        IntervalEndIndex {
+            inner: EndIndexInner::Ranked(RankedEndIndex::from_parts(ends, bits)),
+        }
     }
 
     /// Build the index in memory over a dictionary's DateTimeInterval
     /// segment (used at layer-open for layers without index files).
     pub fn build(dict: &TypedDict) -> Self {
+        IntervalEndIndex {
+            inner: EndIndexInner::Ranked(RankedEndIndex::build(dict)),
+        }
+    }
+
+    /// The wide form for dictionaries holding an end outside the `(i64,
+    /// u32)` rank domain: floor-form `EndKey`s in segment order.
+    pub(crate) fn wide(keys: Vec<EndKey>) -> Self {
+        IntervalEndIndex {
+            inner: EndIndexInner::Wide(WideEndIndex::build(keys)),
+        }
+    }
+
+    /// Number of interval positions covered.
+    pub fn len(&self) -> usize {
+        match &self.inner {
+            EndIndexInner::Ranked(r) => r.tree.len(),
+            EndIndexInner::Wide(w) => w.ranks.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Number of distinct end keys — the rank-table width, either form.
+    pub fn num_distinct_ends(&self) -> usize {
+        match &self.inner {
+            EndIndexInner::Ranked(r) => r.num_distinct_ends(),
+            EndIndexInner::Wide(w) => w.distinct.len(),
+        }
+    }
+
+    /// Segment positions in `pos` with `end <= (secs, nanos)`. Unknown ends
+    /// are excluded: an unspecified end satisfies no instant comparison.
+    pub fn positions_end_le(&self, pos: Range<u64>, secs: i64, nanos: u32) -> Vec<u64> {
+        match &self.inner {
+            EndIndexInner::Ranked(r) => r.positions_end_le(pos, secs, nanos),
+            EndIndexInner::Wide(w) => w.positions_end_le(pos, secs, nanos),
+        }
+    }
+
+    /// Segment positions in `pos` with `end < (secs, nanos)`. Unknown ends
+    /// are excluded.
+    pub fn positions_end_lt(&self, pos: Range<u64>, secs: i64, nanos: u32) -> Vec<u64> {
+        match &self.inner {
+            EndIndexInner::Ranked(r) => r.positions_end_lt(pos, secs, nanos),
+            EndIndexInner::Wide(w) => w.positions_end_lt(pos, secs, nanos),
+        }
+    }
+
+    /// Segment positions in `pos` with `end >= (secs, nanos)`.
+    pub fn positions_end_ge(&self, pos: Range<u64>, secs: i64, nanos: u32) -> Vec<u64> {
+        match &self.inner {
+            EndIndexInner::Ranked(r) => r.positions_end_ge(pos, secs, nanos),
+            EndIndexInner::Wide(w) => w.positions_end_ge(pos, secs, nanos),
+        }
+    }
+
+    /// Segment positions in `pos` with `end > (secs, nanos)`.
+    pub fn positions_end_gt(&self, pos: Range<u64>, secs: i64, nanos: u32) -> Vec<u64> {
+        match &self.inner {
+            EndIndexInner::Ranked(r) => r.positions_end_gt(pos, secs, nanos),
+            EndIndexInner::Wide(w) => w.positions_end_gt(pos, secs, nanos),
+        }
+    }
+
+    /// Segment positions in `pos` with `end == (secs, nanos)`.
+    pub fn positions_end_eq(&self, pos: Range<u64>, secs: i64, nanos: u32) -> Vec<u64> {
+        match &self.inner {
+            EndIndexInner::Ranked(r) => r.positions_end_eq(pos, secs, nanos),
+            EndIndexInner::Wide(w) => w.positions_end_eq(pos, secs, nanos),
+        }
+    }
+
+    /// Segment positions in `pos` with `end` in `[lo, hi]` inclusive.
+    /// Unknown ends are excluded.
+    pub fn positions_end_range(&self, pos: Range<u64>, lo: (i64, u32), hi: (i64, u32)) -> Vec<u64> {
+        match &self.inner {
+            EndIndexInner::Ranked(r) => r.positions_end_range(pos, lo, hi),
+            EndIndexInner::Wide(w) => w.positions_end_range(pos, lo, hi),
+        }
+    }
+}
+
+impl RankedEndIndex {
+    fn from_parts(ends: LogArray, bits: BitIndex) -> Self {
+        let tree = WaveletTree::from_parts(bits, end_rank_width(ends.len() / 2));
+        RankedEndIndex { ends, tree }
+    }
+
+    fn build(dict: &TypedDict) -> Self {
         let ends = interval_segment_ends(dict);
         let mut distinct = ends.clone();
         distinct.sort_unstable();
@@ -792,34 +1193,15 @@ impl IntervalEndIndex {
             .iter()
             .map(|e| distinct.binary_search(e).unwrap() as u64);
         let tree = wavelet_tree_from_iter(end_rank_width(distinct.len()), ranks);
-        IntervalEndIndex {
+        RankedEndIndex {
             ends: ends_table,
             tree,
         }
     }
 
-    /// Number of interval positions covered.
-    pub fn len(&self) -> usize {
-        self.tree.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.tree.len() == 0
-    }
-
     /// Number of distinct end keys in the rank table.
-    pub fn num_distinct_ends(&self) -> usize {
+    fn num_distinct_ends(&self) -> usize {
         self.ends.len() / 2
-    }
-
-    /// First rank whose end key is `>= (secs, nanos)`.
-    pub fn end_lower_bound(&self, secs: i64, nanos: u32) -> u64 {
-        self.end_search(secs, nanos, false)
-    }
-
-    /// First rank whose end key is `> (secs, nanos)`.
-    pub fn end_upper_bound(&self, secs: i64, nanos: u32) -> u64 {
-        self.end_search(secs, nanos, true)
     }
 
     fn end_search(&self, secs: i64, nanos: u32, upper: bool) -> u64 {
@@ -843,65 +1225,28 @@ impl IntervalEndIndex {
         lo
     }
 
+}
+
+impl EndRankIndex for RankedEndIndex {
+    fn end_lower_bound(&self, secs: i64, nanos: u32) -> u64 {
+        self.end_search(secs, nanos, false)
+    }
+
+    fn end_upper_bound(&self, secs: i64, nanos: u32) -> u64 {
+        self.end_search(secs, nanos, true)
+    }
+
     /// First rank above the unknown-end block (rank keys `(_, _)` >
-    /// `(INTERVAL_UNKNOWN_END, 0)`): NULL-semantics cut for the `le`/`lt`
-    /// family, whose ranges otherwise reach rank 0.
+    /// `(INTERVAL_UNKNOWN_END, 0)`).
     fn first_non_unknown_end_rank(&self) -> u64 {
-        self.end_lower_bound(INTERVAL_UNKNOWN_END + 1, 0)
+        self.end_search(INTERVAL_UNKNOWN_END + 1, 0, false)
     }
 
-    /// Segment positions in `pos` with `end <= (secs, nanos)`. Unknown ends
-    /// are excluded: an unspecified end satisfies no instant comparison.
-    pub fn positions_end_le(&self, pos: Range<u64>, secs: i64, nanos: u32) -> Vec<u64> {
-        match self.end_upper_bound(secs, nanos) {
-            0 => Vec::new(),
-            hi => self
-                .tree
-                .positions_in_range(pos, self.first_non_unknown_end_rank(), hi - 1),
-        }
+    fn num_ranks(&self) -> u64 {
+        self.num_distinct_ends() as u64
     }
 
-    /// Segment positions in `pos` with `end < (secs, nanos)`. Unknown ends
-    /// are excluded.
-    pub fn positions_end_lt(&self, pos: Range<u64>, secs: i64, nanos: u32) -> Vec<u64> {
-        match self.end_lower_bound(secs, nanos) {
-            0 => Vec::new(),
-            hi => self
-                .tree
-                .positions_in_range(pos, self.first_non_unknown_end_rank(), hi - 1),
-        }
-    }
-
-    /// Segment positions in `pos` with `end >= (secs, nanos)`.
-    pub fn positions_end_ge(&self, pos: Range<u64>, secs: i64, nanos: u32) -> Vec<u64> {
-        self.tree
-            .positions_ge(pos, self.end_lower_bound(secs, nanos))
-    }
-
-    /// Segment positions in `pos` with `end > (secs, nanos)`.
-    pub fn positions_end_gt(&self, pos: Range<u64>, secs: i64, nanos: u32) -> Vec<u64> {
-        self.tree
-            .positions_ge(pos, self.end_upper_bound(secs, nanos))
-    }
-
-    /// Segment positions in `pos` with `end == (secs, nanos)`.
-    pub fn positions_end_eq(&self, pos: Range<u64>, secs: i64, nanos: u32) -> Vec<u64> {
-        let lo = self.end_lower_bound(secs, nanos);
-        let hi = self.end_upper_bound(secs, nanos);
-        if lo >= hi {
-            Vec::new()
-        } else {
-            self.tree.positions_in_range(pos, lo, hi - 1)
-        }
-    }
-
-    /// Segment positions in `pos` with `end` in `[lo, hi]` inclusive.
-    /// Unknown ends are excluded.
-    pub fn positions_end_range(&self, pos: Range<u64>, lo: (i64, u32), hi: (i64, u32)) -> Vec<u64> {
-        let r_lo = self
-            .end_lower_bound(lo.0, lo.1)
-            .max(self.first_non_unknown_end_rank());
-        let r_hi = self.end_upper_bound(hi.0, hi.1);
+    fn ranks_in_range(&self, pos: Range<u64>, r_lo: u64, r_hi: u64) -> Vec<u64> {
         if r_lo >= r_hi {
             Vec::new()
         } else {
