@@ -55,7 +55,7 @@ fn time<F: FnMut() -> R, R>(n: usize, mut f: F) -> u128 {
 // An instant is `secs + frac/10^len` seconds from the Unix epoch, where secs is
 // an arbitrary-precision integer (chrono's ~±262k-year calendar range does not
 // bound the ordering domain) and frac is an arbitrary-precision decimal digit
-// string (planck scale ~44 digits and beyond).
+// string (sub-Planck precision — up to 49 digits).
 //
 // Three representations are compared:
 //   Rational — rug::Rational (GMP mpq), canonicalised at construction.
@@ -93,30 +93,30 @@ const TIERS: &[(&str, Parts)] = &[
         },
     ),
     (
-        "planck44",
+        "planck49",
         Parts {
             is_neg: false,
             int: "1738233000",
-            frac_a: "00000000000000000000000000000000000000000539",
-            frac_b: "00000000000000000000000000000000000000000540",
+            frac_a: "0000000000000000000000000000000000000000053900000",
+            frac_b: "0000000000000000000000000000000000000000053900001",
         },
     ),
     (
-        "universe-age + frac44",
+        "universe-age + frac49",
         Parts {
             is_neg: false,
             int: "435000000000000000",
-            frac_a: "12345678901234567890123456789012345678901234",
-            frac_b: "12345678901234567890123456789012345678901235",
+            frac_a: "1234567890123456789012345678901234567890123456789",
+            frac_b: "1234567890123456789012345678901234567890123456790",
         },
     ),
     (
-        "deep-time 1e30 + frac44",
+        "deep-time 1e30 + frac49",
         Parts {
             is_neg: false,
             int: "1000000000000000000000000000000",
-            frac_a: "12345678901234567890123456789012345678901234",
-            frac_b: "12345678901234567890123456789012345678901235",
+            frac_a: "1234567890123456789012345678901234567890123456789",
+            frac_b: "1234567890123456789012345678901234567890123456790",
         },
     ),
     (
