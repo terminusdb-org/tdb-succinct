@@ -1,8 +1,9 @@
 //! Lexical `xsd:duration` dictionary entries — see
 //! `lexical-duration-format.md` for the byte-level format this module
-//! implements: a sign byte, then the magnitude tuple (week, year, month,
-//! day, hour, minute, second-int, fraction, `frac_len`) as
-//! `bigint_to_storage`/`integer_and_fraction_to_storage` components,
+//! implements, and terminusdb-enterprise/docs/specifications/xsd-duration.md for the
+//! datatype contract. Byte layout: a sign byte, then the magnitude tuple
+//! (week, year, month, day, hour, minute, second-int, fraction, `frac_len`)
+//! as `bigint_to_storage`/`integer_and_fraction_to_storage` components,
 //! payload bitwise-complemented for negative durations.
 
 #[cfg(test)]

@@ -1,4 +1,5 @@
 //! Lexical-payload interval encoding (`xdd:dateTimeInterval` v2).
+//! Datatype contract: terminusdb-enterprise/docs/specifications/xdd-datetimeinterval.md
 //!
 //! Each entry stores the supplied interval string — lightly canonicalised
 //! (date/time separators stripped, restored at render) — plus a derived sort
@@ -34,9 +35,11 @@
 use super::datatypes::Duration;
 use super::decimal::{decode_fraction, integer_and_fraction_to_storage};
 use super::integer::storage_to_bigint_and_sign;
-use super::interval::{parse_iso_duration, IntervalParseError, UnboundedEndpoint};
+use super::interval::{
+    parse_precise_duration, IntervalParseError, PreciseDuration, UnboundedEndpoint,
+};
 use bytes::{Buf, BufMut, BytesMut};
-use chrono::{Datelike, NaiveDate, Timelike};
+use chrono::{Datelike, NaiveDate};
 use rug::Integer;
 use thiserror::Error;
 
@@ -102,13 +105,6 @@ fn is_leap_day(key: i64) -> bool {
     key >= 0 && LEAP_DAYS.binary_search(&(key as u32)).is_ok()
 }
 
-/// Leap-aware seconds since epoch for a wall-clock `(date, sod)`. `sod` counts
-/// seconds of day *including* a leap second, so `86400` is valid on leap days.
-fn leap_aware_secs(date: NaiveDate, sod: i64, offset_minutes: i16) -> i64 {
-    let base = date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
-    base + leaps_before(day_key(date)) + sod - offset_minutes as i64 * 60
-}
-
 /// POSIX epoch seconds → leap-aware seconds: the domain that instants, probe
 /// boundaries and end-index rank keys live in. Adds the count of leap days
 /// strictly before the instant's wall date.
@@ -152,6 +148,11 @@ pub const FLAG_DURATION_END: u8 = 2; // P/T
 /// `FLAG_EXPLICIT` at equal bounds — the entry keeps the supplied
 /// single-component spelling.
 pub const FLAG_POINT: u8 = 3; // T
+/// `T/T/P` — explicit bounds plus a declared period. The declaration is part
+/// of the literal: it must equal the materialised span
+/// (`start + declared == end` on the stored bounds) and is kept in the
+/// entry's period field, rendered back as the third component.
+pub const FLAG_DECLARED_PERIOD: u8 = 4; // T/T/P
 
 // -- errors -------------------------------------------------------------------
 
@@ -161,6 +162,10 @@ pub enum LexicalIntervalError {
     Parse(#[from] IntervalParseError),
     #[error("special classes are incommensurable within one interval: `{0}`")]
     Incommensurable(String),
+    #[error("inverted interval (start after end): `{0}`")]
+    Inverted(String),
+    #[error("declared period does not equal the interval's span: `{0}`")]
+    PeriodMismatch(String),
     #[error("invalid component: `{0}`")]
     InvalidComponent(String),
     #[error("character outside the payload alphabet: `{0}`")]
@@ -230,7 +235,7 @@ impl Component {
         }
     }
 
-    fn canonical_str(&self) -> &str {
+    pub fn canonical_str(&self) -> &str {
         match self {
             Component::Finite(f) => &f.canonical,
             Component::Unbounded => "..",
@@ -273,7 +278,7 @@ fn canonicalise_component(s: &str) -> String {
 
 /// Re-insert separators into a canonicalised finite component:
 /// `YYYYMMDD[T]HHMMSS[.frac][Z|±HHMM]` → `YYYY-MM-DDTHH:MM:SS[.frac][±HH:MM]`.
-fn extend_component(s: &str) -> String {
+pub fn extend_component(s: &str) -> String {
     let (sign, body) = match s.strip_prefix('-') {
         Some(b) => ("-", b),
         None => ("", s),
@@ -282,18 +287,36 @@ fn extend_component(s: &str) -> String {
     out.push_str(sign);
 
     // date portion: all digits before `T`; the last four are MMDD, the rest
-    // is the (possibly expanded) year.
+    // is the (possibly expanded) year. A date may carry a zone tail
+    // (`20031231+0500`, `20031231Z`) — split it before the digit check.
     let (datep, after_date) = match body.find('T') {
         Some(p) => (&body[..p], Some(&body[p..])),
         None => (body, None),
     };
-    if datep.len() >= 8 && datep.chars().all(|c| c.is_ascii_digit()) {
-        let yend = datep.len() - 4;
-        out.push_str(&datep[..yend]);
+    let (ddigits, dzone) = match datep.find(['+', '-', 'Z']) {
+        Some(p) => (&datep[..p], &datep[p..]),
+        None => (datep, ""),
+    };
+    if ddigits.len() >= 8 && ddigits.chars().all(|c| c.is_ascii_digit()) {
+        let yend = ddigits.len() - 4;
+        out.push_str(&ddigits[..yend]);
         out.push('-');
-        out.push_str(&datep[yend..yend + 2]);
+        out.push_str(&ddigits[yend..yend + 2]);
         out.push('-');
-        out.push_str(&datep[yend + 2..]);
+        out.push_str(&ddigits[yend + 2..]);
+        match dzone {
+            "" => {}
+            "Z" => out.push('Z'),
+            _ if dzone.len() == 5
+                && (dzone.starts_with('+') || dzone.starts_with('-'))
+                && dzone[1..].chars().all(|c| c.is_ascii_digit()) =>
+            {
+                out.push_str(&dzone[..3]);
+                out.push(':');
+                out.push_str(&dzone[3..]);
+            }
+            _ => out.push_str(dzone),
+        }
         if let Some(t) = after_date {
             out.push('T');
             let mut rest = &t[1..];
@@ -339,62 +362,18 @@ fn extend_component(s: &str) -> String {
 
 // -- component parsing --------------------------------------------------------
 
-/// Split a wall-clock time `HH:MM:SS[.frac]` or `HHMMSS[.frac]` into
-/// (seconds_of_day, fraction_digits).
-fn parse_wall_time(s: &str) -> Result<(u32, Option<String>), LexicalIntervalError> {
-    let (hms, frac) = match s.split_once('.') {
-        Some((h, f)) => (h, Some(f.to_string())),
-        None => (s, None),
-    };
-    let digits: String = hms.chars().filter(|c| *c != ':').collect();
-    if digits.len() != 6 || !digits.chars().all(|c| c.is_ascii_digit()) {
-        return Err(LexicalIntervalError::InvalidComponent(s.to_string()));
+/// Storage tz-class byte + unsigned offset minutes for a parsed zone —
+/// the six classes match `tdb_datetime::Tz` one to one.
+fn tz_class_of(tz: tdb_datetime::Tz) -> (u8, i16) {
+    use tdb_datetime::Tz::*;
+    match tz {
+        Neg(m) => (TZ_NEG, m as i16),
+        NegZero => (TZ_NEG_ZERO, 0),
+        Utc => (TZ_Z, 0),
+        Zoneless => (TZ_ZONELESS, 0),
+        PosZero => (TZ_POS_ZERO, 0),
+        Pos(m) => (TZ_POS, m as i16),
     }
-    // `23:59:60` is the leap-second spelling: the extra second before
-    // midnight, i.e. second 86400 of the day. Any other :60 is invalid.
-    let (h, m, sec) = (
-        digits[..2].parse::<u32>().unwrap(),
-        digits[2..4].parse::<u32>().unwrap(),
-        digits[4..6].parse::<u32>().unwrap(),
-    );
-    let secs = if digits == "235960" {
-        86400
-    } else {
-        if h > 23 || m > 59 || sec > 59 {
-            return Err(LexicalIntervalError::InvalidComponent(s.to_string()));
-        }
-        h * 3600 + m * 60 + sec
-    };
-    if let Some(f) = &frac {
-        if f.is_empty() || !f.chars().all(|c| c.is_ascii_digit()) {
-            return Err(LexicalIntervalError::InvalidComponent(s.to_string()));
-        }
-    }
-    Ok((secs, frac))
-}
-
-/// Split a datetime's time-tail into (wall, tz_class, offset_minutes).
-fn parse_zone(s: &str) -> (&str, u8, i16) {
-    if let Some(wall) = s.strip_suffix('Z') {
-        return (wall, TZ_Z, 0);
-    }
-    // zone sign: last '+' or '-' that is not the leading date sign — within the
-    // time tail the only signs are zone signs.
-    let pos = s.rfind(['+', '-']);
-    if let Some(i) = pos {
-        let zone = &s[i..];
-        let digits: String = zone[1..].chars().filter(|c| *c != ':').collect();
-        if digits.len() == 4 && digits.chars().all(|c| c.is_ascii_digit()) {
-            let off =
-                digits[..2].parse::<i16>().unwrap() * 60 + digits[2..].parse::<i16>().unwrap();
-            let (cls, val) = match zone.as_bytes()[0] {
-                b'+' => (if off == 0 { TZ_POS_ZERO } else { TZ_POS }, off),
-                _ => (if off == 0 { TZ_NEG_ZERO } else { TZ_NEG }, -off),
-            };
-            return (&s[..i], cls, val);
-        }
-    }
-    (s, TZ_ZONELESS, 0)
 }
 
 /// (is_neg, signed ceiling int, canonical frac, supplied digit count) from
@@ -404,7 +383,7 @@ fn parse_zone(s: &str) -> (&str, u8, i16) {
 /// `secs=-2, frac="5"` (v=-1.5) stores int=-1, frac="5" (= 10-5). An
 /// integral negative (`.00`) stores no canonical frac; its dot survives
 /// through `frac_len` alone.
-fn instant_parts(secs: i64, frac: Option<String>) -> (bool, Integer, Option<String>, u8) {
+fn instant_parts(secs: i128, frac: Option<String>) -> (bool, Integer, Option<String>, u8) {
     let canon = |f: &str| {
         let t = f.trim_end_matches('0');
         if t.is_empty() {
@@ -441,29 +420,18 @@ fn instant_parts(secs: i64, frac: Option<String>) -> (bool, Integer, Option<Stri
     }
 }
 
+/// One finite component — strict `xsd:dateTime` / `xsd:date` lexical space
+/// via `tdb-datetime`. A zoned date `D+off` is the whole day *in that zone*:
+/// kind stays DATE, the offset applies to the bound instants, and the
+/// supplied spelling is kept in `canonical` for rendering.
 fn parse_finite(s: &str, is_end: bool) -> Result<FiniteComponent, LexicalIntervalError> {
     let canonical = canonicalise_component(s);
-    if let Some(t_pos) = s.find('T') {
-        // dateTime component
-        let date_part = &s[..t_pos];
-        let (wall, tz_class, offset_minutes) = parse_zone(&s[t_pos + 1..]);
-        let (sod, frac) = parse_wall_time(wall)?;
-        let date = NaiveDate::parse_from_str(date_part, "%Y-%m-%d")
-            .map_err(|_| LexicalIntervalError::InvalidComponent(s.to_string()))?;
-        // `23:59:60` is the real second before midnight on IERS leap days —
-        // anywhere else it is invalid, like Feb 29 in a common year.
-        if sod as i64 == 86400 && !is_leap_day(day_key(date)) {
-            return Err(LexicalIntervalError::InvalidComponent(s.to_string()));
-        }
-        let secs = leap_aware_secs(
-            date,
-            sod as i64,
-            if tz_class == TZ_ZONELESS {
-                0
-            } else {
-                offset_minutes
-            },
-        );
+    let invalid = || LexicalIntervalError::InvalidComponent(s.to_string());
+    if s.contains('T') {
+        let dt = tdb_datetime::parse_datetime(s).map_err(|_| invalid())?;
+        let (tz_class, offset_minutes) = tz_class_of(dt.tz);
+        let secs = dt.leap_aware_instant().ok_or_else(invalid)?;
+        let frac = (!dt.frac.is_empty()).then(|| dt.frac.to_string());
         let (is_neg, int, frac, frac_len) = instant_parts(secs, frac);
         Ok(FiniteComponent {
             is_neg,
@@ -472,17 +440,17 @@ fn parse_finite(s: &str, is_end: bool) -> Result<FiniteComponent, LexicalInterva
             frac_len,
             kind: KIND_DATETIME,
             tz_class,
-            offset_minutes: offset_minutes.abs(),
+            offset_minutes,
             canonical,
         })
     } else {
-        // date component — inclusive whole day, local-time managed
-        let mut date = NaiveDate::parse_from_str(s, "%Y-%m-%d")
-            .map_err(|_| LexicalIntervalError::InvalidComponent(s.to_string()))?;
+        // date component — inclusive whole day in its zone
+        let mut d = tdb_datetime::parse_date(s).map_err(|_| invalid())?;
         if is_end {
-            date = date.succ_opt().unwrap_or(date);
+            d = d.next_day().ok_or_else(invalid)?;
         }
-        let secs = leap_aware_secs(date, 0, 0);
+        let (tz_class, offset_minutes) = tz_class_of(d.tz);
+        let secs = d.leap_aware_start().ok_or_else(invalid)?;
         let (is_neg, int, frac, frac_len) = instant_parts(secs, None);
         Ok(FiniteComponent {
             is_neg,
@@ -490,8 +458,8 @@ fn parse_finite(s: &str, is_end: bool) -> Result<FiniteComponent, LexicalInterva
             frac,
             frac_len,
             kind: KIND_DATE,
-            tz_class: TZ_ZONELESS,
-            offset_minutes: 0,
+            tz_class,
+            offset_minutes,
             canonical,
         })
     }
@@ -499,18 +467,13 @@ fn parse_finite(s: &str, is_end: bool) -> Result<FiniteComponent, LexicalInterva
 
 /// A component instant derived from duration arithmetic (nanos precision).
 fn computed_finite(
-    secs: i64,
-    nanos: u32,
+    secs: i128,
+    frac: Option<String>,
     kind: u8,
     tz_class: u8,
     offset_minutes: i16,
     canonical: String,
 ) -> FiniteComponent {
-    let frac = if nanos == 0 {
-        None
-    } else {
-        Some(format!("{:09}", nanos))
-    };
     let (is_neg, int, frac, _) = instant_parts(secs, frac);
     let frac_len = frac.as_deref().map_or(0, |d| d.len() as u8);
     FiniteComponent {
@@ -569,6 +532,8 @@ pub fn parse_lexical_interval(s: &str) -> Result<LexicalInterval, LexicalInterva
     };
     let (left, right) = (&s[..slash], &s[slash + 1..]);
 
+    // `-P` never reaches the duration parser — it is caught here so the
+    // report is InvalidDuration, not a component parse error.
     let left_dur = left.starts_with('P') || left.starts_with("-P");
     let right_dur = right.starts_with('P') || right.starts_with("-P");
     if left_dur && right_dur {
@@ -591,17 +556,19 @@ pub fn parse_lexical_interval(s: &str) -> Result<LexicalInterval, LexicalInterva
         if UnboundedEndpoint::from_str(anchored).is_some() || anchored == "X*" {
             return Err(IntervalParseError::UnboundedWithDuration(s.to_string()).into());
         }
-        let duration = parse_iso_duration(if left_dur { left } else { right })?;
+        let duration = parse_precise_duration(if left_dur { left } else { right })?;
         if left_dur {
             let end = parse_finite(anchored, true)?;
-            let (s_secs, s_nanos) = secs_nanos(&end);
+            let (s_secs, s_frac) =
+                secs_frac(&end).ok_or_else(|| LexicalIntervalError::InvalidComponent(s.to_string()))?;
             let (cs, cn) = duration_shifted(
                 &duration,
                 s_secs,
-                s_nanos,
+                s_frac.as_deref(),
                 tshift_secs(end.tz_class, end.offset_minutes),
                 -1,
-            );
+            )
+            .ok_or_else(|| LexicalIntervalError::InvalidComponent(s.to_string()))?;
             let start = Component::Finite(computed_finite(
                 cs,
                 cn,
@@ -618,14 +585,16 @@ pub fn parse_lexical_interval(s: &str) -> Result<LexicalInterval, LexicalInterva
             })
         } else {
             let start = parse_finite(anchored, false)?;
-            let (s_secs, s_nanos) = secs_nanos(&start);
+            let (s_secs, s_frac) =
+                secs_frac(&start).ok_or_else(|| LexicalIntervalError::InvalidComponent(s.to_string()))?;
             let (ce, cn) = duration_shifted(
                 &duration,
                 s_secs,
-                s_nanos,
+                s_frac.as_deref(),
                 tshift_secs(start.tz_class, start.offset_minutes),
                 1,
-            );
+            )
+            .ok_or_else(|| LexicalIntervalError::InvalidComponent(s.to_string()))?;
             let end = Component::Finite(computed_finite(
                 ce,
                 cn,
@@ -642,8 +611,18 @@ pub fn parse_lexical_interval(s: &str) -> Result<LexicalInterval, LexicalInterva
             })
         }
     } else {
+        // `T/T/P`: a second '/' separates the end bound from a declared
+        // period, which must equal the materialised span — the supplied
+        // duration is a claim about the bounds, not a derivation of them.
+        let (mid, declared) = match right.find('/') {
+            Some(i) => (
+                &right[..i],
+                Some(parse_precise_duration(&right[i + 1..])?),
+            ),
+            None => (right, None),
+        };
         let start = parse_component(left, false)?;
-        let end = parse_component(right, true)?;
+        let end = parse_component(mid, true)?;
 
         // incommensurability: at most one special class per interval
         let mut classes = [start.is_special(), end.is_special()]
@@ -656,42 +635,93 @@ pub fn parse_lexical_interval(s: &str) -> Result<LexicalInterval, LexicalInterva
             return Err(LexicalIntervalError::Incommensurable(s.to_string()));
         }
 
+        // an explicit pair is [start, end) — a start after the end is an
+        // empty interval; equal bounds are a legal zero-length pair
+        if let (Component::Finite(sf), Component::Finite(ef)) = (&start, &end) {
+            if let (Some((ss, sfra)), Some((es, efra))) = (secs_frac(sf), secs_frac(ef)) {
+                if ss > es
+                    || (ss == es
+                        && frac_cmp(&sfra, &efra) == std::cmp::Ordering::Greater)
+                {
+                    return Err(LexicalIntervalError::Inverted(s.to_string()));
+                }
+            }
+        }
+
+        let flag = match declared {
+            None => FLAG_EXPLICIT,
+            Some(dur) => {
+                // a declared period needs finite bounds to align against,
+                // and `start + declared` must land exactly on the end bound
+                let (sf, ef) = match (&start, &end) {
+                    (Component::Finite(a), Component::Finite(b)) => (a, b),
+                    _ => {
+                        return Err(IntervalParseError::UnboundedWithDuration(
+                            s.to_string(),
+                        )
+                        .into())
+                    }
+                };
+                let (ss, sfra) = secs_frac(sf)
+                    .ok_or_else(|| LexicalIntervalError::InvalidComponent(s.to_string()))?;
+                let (es, efra) = secs_frac(ef)
+                    .ok_or_else(|| LexicalIntervalError::InvalidComponent(s.to_string()))?;
+                let (ds, dfrac) = duration_shifted(
+                    &dur,
+                    ss,
+                    sfra.as_deref(),
+                    tshift_secs(sf.tz_class, sf.offset_minutes),
+                    1,
+                )
+                .ok_or_else(|| LexicalIntervalError::InvalidComponent(s.to_string()))?;
+                if ds != es || frac_cmp(&dfrac, &efra) != std::cmp::Ordering::Equal {
+                    return Err(LexicalIntervalError::PeriodMismatch(s.to_string()));
+                }
+                FLAG_DECLARED_PERIOD
+            }
+        };
+
         Ok(LexicalInterval {
             start,
             end,
-            flag: FLAG_EXPLICIT,
+            flag,
             canonical,
         })
     }
 }
 
-/// Recover (secs, nanos) for the duration-arithmetic helpers, which work at
-/// nanos precision and chrono's floor convention (secs + nanos, nanos ≥ 0).
+/// Recover (floor secs, canonical value-frac digits) at full precision for
+/// the duration-arithmetic helpers. `i128` seconds; fraction digits are
+/// verbatim — no nanos truncation. `None` only on entry-corruption domain
+/// overflow.
+fn secs_frac(f: &FiniteComponent) -> Option<(i128, Option<String>)> {
+    instant_floor(f, 0)
+}
+
+/// Lexicographic compare on value-frac digit strings — the shorter is
+/// right-padded with '0', so `.5` and `.50` compare equal.
+fn frac_cmp(a: &Option<String>, b: &Option<String>) -> std::cmp::Ordering {
+    let (a, b) = (a.as_deref().unwrap_or(""), b.as_deref().unwrap_or(""));
+    let n = a.len().max(b.len());
+    a.bytes()
+        .chain(std::iter::repeat(b'0'))
+        .take(n)
+        .cmp(b.bytes().chain(std::iter::repeat(b'0')).take(n))
+}
+
+/// `secs_frac` narrowed to the legacy `(i64 secs, u32 nanos)` convention —
+/// for marshal/probe/test paths whose domain is i64 by construction.
+/// Duration arithmetic uses `secs_frac` at full precision instead.
 fn secs_nanos(f: &FiniteComponent) -> (i64, u32) {
-    // out-of-i64 seconds are unreachable through chrono-bounded parsing; if
-    // expanded years ever land they must widen this path, not clamp.
-    let int = f.int.to_i64().expect("finite seconds outside i64");
-    let nanos9 = |d: &str| {
+    let (secs, frac) = secs_frac(f).expect("finite seconds outside i64");
+    let nanos = frac.as_deref().map_or(0, |d| {
         let mut s = d[..d.len().min(9)].to_string();
         while s.len() < 9 {
             s.push('0');
         }
         s.parse::<u32>().unwrap_or(0)
-    };
-    match &f.frac {
-        None => (int, 0),
-        // value = int + 0.frac → floor secs = int
-        Some(d) if !f.is_neg => (int, nanos9(d)),
-        // value = int - 0.frac → floor secs = int - 1, subsec = 1 - 0.frac
-        // (the 10^len - frac complement, truncated to nanos).
-        Some(d) => {
-            let len = d.len();
-            let ten = format!("1{}", "0".repeat(len)).parse::<Integer>().unwrap();
-            let comp = &ten - d.parse::<Integer>().unwrap();
-            let padded = format!("{:0>width$}", comp.to_string(), width = len);
-            (int - 1, nanos9(&padded))
-        }
-    }
+    });
+    (secs.try_into().expect("finite seconds outside i64"), nanos)
 }
 
 // -- entry encode/decode ------------------------------------------------------
@@ -736,11 +766,11 @@ fn component_meta_key(c: &Component, out: &mut BytesMut) {
 /// in a frame shifted by `shift` seconds. Negative-value fracs count down
 /// from the ceiling int, so the sub-second digits are the `10^len - frac`
 /// complement.
-fn instant_floor(f: &FiniteComponent, shift: i64) -> (i64, Option<String>) {
-    let int = f.int.to_i64().expect("finite seconds outside i64");
+fn instant_floor(f: &FiniteComponent, shift: i128) -> Option<(i128, Option<String>)> {
+    let int = f.int.to_i128()?;
     match &f.frac {
-        None => (int + shift, None),
-        Some(d) if !f.is_neg => (int + shift, Some(d.clone())),
+        None => Some((int + shift, None)),
+        Some(d) if !f.is_neg => Some((int + shift, Some(d.clone()))),
         Some(d) => {
             let len = d.len();
             let ten = format!("1{}", "0".repeat(len)).parse::<Integer>().unwrap();
@@ -749,16 +779,16 @@ fn instant_floor(f: &FiniteComponent, shift: i64) -> (i64, Option<String>) {
                 (&ten - d.parse::<Integer>().unwrap()).to_string(),
                 width = len
             );
-            (int - 1 + shift, Some(comp))
+            Some((int - 1 + shift, Some(comp)))
         }
     }
 }
 
 /// Signed shift seconds of a timeshift class.
-fn tshift_secs(tz_class: u8, offset_minutes: i16) -> i64 {
+fn tshift_secs(tz_class: u8, offset_minutes: i16) -> i128 {
     match tz_class {
-        TZ_NEG => -(offset_minutes as i64) * 60,
-        TZ_POS => offset_minutes as i64 * 60,
+        TZ_NEG => -(offset_minutes as i128) * 60,
+        TZ_POS => offset_minutes as i128 * 60,
         _ => 0,
     }
 }
@@ -769,56 +799,94 @@ fn tshift_secs(tz_class: u8, offset_minutes: i16) -> i64 {
 /// including leap seconds. `direction` is +1 for end-from-start, -1 for
 /// start-from-end (the duration's own sign applies on top).
 fn duration_shifted(
-    dur: &Duration,
-    secs: i64,
-    nanos: u32,
-    tshift: i64,
-    direction: i64,
-) -> (i64, u32) {
+    dur: &PreciseDuration,
+    secs: i128,
+    frac: Option<&str>,
+    tshift: i128,
+    direction: i128,
+) -> Option<(i128, Option<String>)> {
     let sign = if dur.sign >= 0 { direction } else { -direction };
     // wall domain of the anchor, in its own frame. `leap60` marks the
     // anchor's position one real second inside minute 23:59 — carried as
     // +1 s into the re-encoded instant so an anchor on `23:59:60` is not
     // silently shifted back to `:59`.
-    let (mut dt, leap60) = leap_instant_to_naive(secs + tshift);
-    if dur.year != 0 || dur.month != 0 {
-        dt = shift_months(dt, sign * (dur.year * 12 + dur.month as i64));
+    let (mut y, mut m, mut d, sod, leap60) =
+        tdb_datetime::leap_instant_to_wall(secs.checked_add(tshift)?)?;
+    // calendar month shift — day clamps to the target month (Jan 31 + 1M →
+    // Feb 28/29)
+    let months = dur
+        .year
+        .checked_mul(12)?
+        .checked_add(dur.month)?
+        .checked_mul(sign)?;
+    if months != 0 {
+        let total = y.checked_mul(12)?.checked_add(m as i128 - 1)?.checked_add(months)?;
+        y = total.div_euclid(12);
+        m = (total.rem_euclid(12) + 1) as u8;
+        d = d.min(tdb_datetime::days_in_month(y, m));
     }
-    dt += chrono::Duration::seconds(
-        sign * (dur.day as i64 * 86400 + dur.hour as i64 * 3600 + dur.minute as i64 * 60),
-    );
-    // back to the leap-aware instant domain, frame removed; `leap60` adds
-    // the anchor's real +1 s position inside minute 23:59
-    let base = leap_aware_secs(dt.date(), dt.time().num_seconds_from_midnight() as i64, 0)
-        + leap60 as i64
-        - tshift;
-    let mut out_secs = base + sign * dur.second.trunc() as i64;
-    // fractional seconds carry as real nanos with a proper borrow
-    let mut n = nanos as i64 + sign * (dur.second.fract().abs() * 1e9).round() as i64;
-    if n < 0 {
-        n += 1_000_000_000;
-        out_secs -= 1;
-    } else if n >= 1_000_000_000 {
-        n -= 1_000_000_000;
-        out_secs += 1;
-    }
-    (out_secs, n as u32)
+    // wall days/hours/minutes shift — pure civil seconds, then back to the
+    // leap-aware domain on the resulting wall date
+    let wall = tdb_datetime::days_from_civil(y, m, d)?
+        .checked_mul(86400)?
+        .checked_add(sod as i128)?
+        .checked_add(
+            dur.day
+                .checked_mul(86400)?
+                .checked_add(dur.hour.checked_mul(3600)?)?
+                .checked_add(dur.minute.checked_mul(60)?)?
+                .checked_mul(sign)?,
+        )?;
+    let (wy, wm, wd) = tdb_datetime::civil_from_days(wall.div_euclid(86400));
+    let base = wall
+        .checked_add(tdb_datetime::leaps_before(wy, wm, wd))?
+        .checked_add(leap60 as i128)?
+        .checked_sub(tshift)?;
+    let mut out_secs = base.checked_add(dur.sec_int.checked_mul(sign)?)?;
+    // exact decimal fraction arithmetic — align, add signed, carry
+    let (carry, out_frac) = add_signed_frac(frac, sign, dur.sec_frac.as_deref());
+    out_secs = out_secs.checked_add(carry)?;
+    Some((out_secs, out_frac))
 }
 
-/// Add `months` calendar months, sign-split onto chrono's checked month
-/// arithmetic (clamps to the target month's last day: Jan 31 + 1mo → Feb 28).
-fn shift_months(dt: chrono::NaiveDateTime, months: i64) -> chrono::NaiveDateTime {
-    let r = if months >= 0 {
-        dt.checked_add_months(chrono::Months::new(months as u32))
-    } else {
-        dt.checked_sub_months(chrono::Months::new(months.unsigned_abs() as u32))
+/// `a + sign·b` on decimal fraction digit strings at a common denominator:
+/// returns (carry into seconds, canonical digits). Carry is -1 on borrow,
+/// +1 on overflow of the denominator.
+fn add_signed_frac(
+    a: Option<&str>,
+    sign: i128,
+    b: Option<&str>,
+) -> (i128, Option<String>) {
+    let len = a.map_or(0, str::len).max(b.map_or(0, str::len));
+    if len == 0 {
+        return (0, None);
+    }
+    let pad = |s: Option<&str>| {
+        let mut t = String::from(s.unwrap_or(""));
+        while t.len() < len {
+            t.push('0');
+        }
+        t.parse::<Integer>().unwrap()
     };
-    r.expect("month shift in range")
+    let ten: Integer = format!("1{}", "0".repeat(len)).parse().unwrap();
+    let mut v = pad(a) + Integer::from(sign) * pad(b);
+    let mut carry = 0i128;
+    while v < 0 {
+        v += &ten;
+        carry -= 1;
+    }
+    while v >= ten {
+        v -= &ten;
+        carry += 1;
+    }
+    let digits = format!("{:0>width$}", v, width = len);
+    let t = digits.trim_end_matches('0');
+    (carry, if t.is_empty() { None } else { Some(t.to_string()) })
 }
 
 /// Decimal subtraction of aligned fraction digit strings: returns
 /// (borrow, digits) — borrow 1 when `a < b`.
-fn sub_frac(a: Option<&str>, b: Option<&str>) -> (i64, Option<String>) {
+fn sub_frac(a: Option<&str>, b: Option<&str>) -> (i128, Option<String>) {
     let len = a.map_or(0, |s| s.len()).max(b.map_or(0, |s| s.len()));
     if len == 0 {
         return (0, None);
@@ -853,8 +921,8 @@ pub fn derived_period(iv: &LexicalInterval) -> String {
         return String::new();
     };
     let shift = tshift_secs(s.tz_class, s.offset_minutes);
-    let (ss, sfrac) = instant_floor(s, shift);
-    let (es, efrac) = instant_floor(e, shift);
+    let (ss, sfrac) = instant_floor(s, shift).expect("entry instant inside the domain");
+    let (es, efrac) = instant_floor(e, shift).expect("entry instant inside the domain");
     // compare (secs, frac) numerically — pad fracs to a common denominator
     let len = sfrac
         .as_deref()
@@ -879,43 +947,48 @@ pub fn derived_period(iv: &LexicalInterval) -> String {
     let es = es - borrow;
     // `leap60` marks the endpoint one real second inside minute 23:59 — it
     // belongs to the last day of its month, so `Y`/`M` decompose on the
-    // naive walls unaffected.
-    let (sdt, s60) = leap_instant_to_naive(ss);
-    let (edt, e60) = leap_instant_to_naive(es);
-    let (s60, e60) = (i64::from(s60), i64::from(e60));
-
-    let mut y = edt.year() as i64 - sdt.year() as i64;
-    let mut anchor = shift_months(sdt, y * 12);
-    if anchor > edt {
+    // civil walls unaffected.
+    let (sy, sm, sd, ssod, s60b) =
+        tdb_datetime::leap_instant_to_wall(ss).expect("entry instant inside the domain");
+    let (ey, em, ed, esod, e60b) =
+        tdb_datetime::leap_instant_to_wall(es).expect("entry instant inside the domain");
+    let (s60, e60) = (i128::from(s60b), i128::from(e60b));
+    // civil wall total (leap-free domain) for (y,m,d,sod) tuples
+    let wall = |y: i128, m: u8, d: u8, sod: u32| {
+        tdb_datetime::days_from_civil(y, m, d).unwrap() * 86400 + sod as i128
+    };
+    // calendar month shift on a date — day clamps to the target month
+    let shift_mo = |y: i128, m: u8, d: u8, months: i128| {
+        let total = y * 12 + m as i128 - 1 + months;
+        let (ny, nm) = (total.div_euclid(12), (total.rem_euclid(12) + 1) as u8);
+        (ny, nm, d.min(tdb_datetime::days_in_month(ny, nm)))
+    };
+    let mut y = ey - sy;
+    let (mut ay, mut am, mut ad) = shift_mo(sy, sm, sd, y * 12);
+    if wall(ay, am, ad, ssod) > wall(ey, em, ed, esod) {
         y -= 1;
-        anchor = shift_months(sdt, y * 12);
+        (ay, am, ad) = shift_mo(sy, sm, sd, y * 12);
     }
-    let mut mo = (edt.year() as i64 - anchor.date().year() as i64) * 12
-        + (edt.month() as i64 - anchor.date().month() as i64);
-    let mut anchor2 = shift_months(anchor, mo);
-    if anchor2 > edt {
+    let mut mo = (ey - ay) * 12 + (em as i128 - am as i128);
+    let (mut a2y, mut a2m, mut a2d) = shift_mo(ay, am, ad, mo);
+    if wall(a2y, a2m, a2d, ssod) > wall(ey, em, ed, esod) {
         mo -= 1;
-        anchor2 = shift_months(anchor, mo);
+        (a2y, a2m, a2d) = shift_mo(ay, am, ad, mo);
     }
-    // wall units decompose on the naive walls — a wall hour that spans a
+    let anchor2_wall = wall(a2y, a2m, a2d, ssod);
+    // wall units decompose on the civil walls — a wall hour that spans a
     // leap second still derives `PT1H`; the `sec` field then counts real
     // elapsed seconds (leap seconds included) after the wall anchor
-    // `D`/`H`/`Min` decompose on flagged position counts — the leap second
-    // is a 61st second inside minute 23:59, so `rem` is the naive span
-    // corrected by the flags; the anchor carries the start flag as a +1 s
-    // real position. `S` then counts real elapsed seconds after the wall
-    // anchor (leap seconds included).
-    let rem = (edt - anchor2).num_seconds() + e60 - s60;
+    let rem = wall(ey, em, ed, esod) - anchor2_wall + e60 - s60;
     let mut d = rem / 86400;
     let mut h = rem % 86400 / 3600;
     let mut mi = rem % 3600 / 60;
-    let real_at = |dt: chrono::NaiveDateTime| {
-        leap_aware_secs(dt.date(), dt.time().num_seconds_from_midnight() as i64, 0) + s60
+    // leap-aware instant of a civil wall total + the start's :60 position
+    let real_at = |w: i128| {
+        let (ry, rm, rd) = tdb_datetime::civil_from_days(w.div_euclid(86400));
+        w + tdb_datetime::leaps_before(ry, rm, rd) + s60
     };
-    let mut anchor5 = anchor2
-        + chrono::Duration::days(d)
-        + chrono::Duration::hours(h)
-        + chrono::Duration::minutes(mi);
+    let mut anchor5 = anchor2_wall + d * 86400 + h * 3600 + mi * 60;
     // an end *on* the leap second can sit just under a picked wall unit —
     // back off the smallest unit until the anchor precedes the real end
     while real_at(anchor5) > es {
@@ -931,10 +1004,7 @@ pub fn derived_period(iv: &LexicalInterval) -> String {
         } else {
             break; // unreachable: the bare start position never passes the end
         }
-        anchor5 = anchor2
-            + chrono::Duration::days(d)
-            + chrono::Duration::hours(h)
-            + chrono::Duration::minutes(mi);
+        anchor5 = anchor2_wall + d * 86400 + h * 3600 + mi * 60;
     }
     let sec = es - real_at(anchor5);
 
@@ -979,6 +1049,10 @@ pub fn derived_period(iv: &LexicalInterval) -> String {
 /// interchangeable), the derived canonical period for `T/T`, empty when no
 /// finite pair exists (all-special intervals).
 fn period_key(iv: &LexicalInterval) -> String {
+    if iv.flag == FLAG_DECLARED_PERIOD {
+        // the third canonical segment carries the supplied declaration
+        return iv.canonical.rsplit('/').next().unwrap_or("").to_string();
+    }
     if iv.flag == FLAG_EXPLICIT || iv.flag == FLAG_POINT {
         return derived_period(iv);
     }
@@ -990,46 +1064,41 @@ fn period_key(iv: &LexicalInterval) -> String {
 /// the entry stores no payload, so rendering derives everything: wall clock
 /// from `instant ± offset`, fraction digits from the stored (complemented
 /// for negatives) digits, zone marker from the tshift class.
-fn reconstruct_component_canonical(f: &FiniteComponent, is_end: bool) -> String {
+fn reconstruct_component_canonical(
+    f: &FiniteComponent,
+    is_end: bool,
+) -> Result<String, LexicalIntervalError> {
     // floor seconds: ceiling-frac negatives step one more down; a stored
     // all-zero frac is integral and needs no step
     let mut secs = f
         .int
-        .to_i64()
-        .expect("finite seconds outside i64 — unreachable via parse");
+        .to_i128()
+        .ok_or(LexicalIntervalError::MalformedEntry)?;
     if f.is_neg && f.frac.is_some() {
         secs -= 1;
     }
     match f.tz_class {
-        TZ_NEG => secs -= f.offset_minutes as i64 * 60,
-        TZ_POS => secs += f.offset_minutes as i64 * 60,
+        TZ_NEG => secs -= f.offset_minutes as i128 * 60,
+        TZ_POS => secs += f.offset_minutes as i128 * 60,
         _ => {}
     }
-    let (mut naive, leap60) = leap_instant_to_naive(secs);
+    let (mut y, mut m, mut d, sod, leap60) = tdb_datetime::leap_instant_to_wall(secs)
+        .ok_or(LexicalIntervalError::MalformedEntry)?;
     // date-kind ends store the exclusive day bound; the supplied spelling is
-    // the inclusive day before — subtract a calendar day on the naive wall,
+    // the inclusive day before — subtract a calendar day on the civil wall,
     // not 86400 domain seconds (a leap-day span is 86401).
     if f.kind == KIND_DATE && is_end {
-        naive -= chrono::Duration::days(1);
+        let day = tdb_datetime::days_from_civil(y, m, d)
+            .and_then(|z| z.checked_sub(1))
+            .ok_or(LexicalIntervalError::MalformedEntry)?;
+        (y, m, d) = tdb_datetime::civil_from_days(day);
     }
-    let y = naive.year();
-    let mut out = format!(
-        "{}{:04}{:02}{:02}",
-        if y < 0 { "-" } else { "" },
-        y.abs(),
-        naive.month(),
-        naive.day()
-    );
+    let mut out = format!("{}{:04}{:02}{:02}", if y < 0 { "-" } else { "" }, y.abs(), m, d);
     if f.kind != KIND_DATE {
         if leap60 {
             out.push_str("T235960");
         } else {
-            out.push_str(&format!(
-                "T{:02}{:02}{:02}",
-                naive.hour(),
-                naive.minute(),
-                naive.second()
-            ));
+            out.push_str(&format!("T{:02}{:02}{:02}", sod / 3600, sod % 3600 / 60, sod % 60));
         }
         if f.frac_len > 0 {
             let supplied = match &f.frac {
@@ -1057,31 +1126,36 @@ fn reconstruct_component_canonical(f: &FiniteComponent, is_end: bool) -> String 
                 out.push('0');
             }
         }
-        match f.tz_class {
-            TZ_NEG | TZ_POS => out.push_str(&format!(
-                "{}{:02}{:02}",
-                if f.tz_class == TZ_NEG { "-" } else { "+" },
-                f.offset_minutes / 60,
-                f.offset_minutes % 60
-            )),
-            TZ_NEG_ZERO => out.push_str("-0000"),
-            TZ_Z => out.push('Z'),
-            TZ_POS_ZERO => out.push_str("+0000"),
-            _ => {}
-        }
     }
-    out
+    // zone suffix applies to dates and dateTimes alike — `xsd:date` carries
+    // the same zone lexical space. Z-family zero-offset spellings are
+    // emitted on dateTimes but suppressed on dates: legacy marshal stamped
+    // TZ_Z on every zoneless date, and `D Z` has identical bounds to `D`
+    // anyway — the suffix would only rewrite existing literals' rendering.
+    match f.tz_class {
+        TZ_NEG | TZ_POS => out.push_str(&format!(
+            "{}{:02}{:02}",
+            if f.tz_class == TZ_NEG { "-" } else { "+" },
+            f.offset_minutes / 60,
+            f.offset_minutes % 60
+        )),
+        TZ_NEG_ZERO if f.kind != KIND_DATE => out.push_str("-0000"),
+        TZ_Z if f.kind != KIND_DATE => out.push('Z'),
+        TZ_POS_ZERO if f.kind != KIND_DATE => out.push_str("+0000"),
+        _ => {}
+    }
+    Ok(out)
 }
 
 /// The component side of the canonical: finite reconstructs, specials are
 /// their fixed spellings.
-fn component_canonical(c: &Component, is_end: bool) -> String {
-    match c {
-        Component::Finite(f) => reconstruct_component_canonical(f, is_end),
+fn component_canonical(c: &Component, is_end: bool) -> Result<String, LexicalIntervalError> {
+    Ok(match c {
+        Component::Finite(f) => reconstruct_component_canonical(f, is_end)?,
         Component::Unbounded => "..".to_string(),
         Component::Unknown => String::new(),
         Component::Unspecified => "X*".to_string(),
-    }
+    })
 }
 
 /// Encode an interval to its dictionary entry bytes.
@@ -1139,6 +1213,81 @@ fn cmp_finite_instant(a: &FiniteComponent, b: &FiniteComponent) -> std::cmp::Ord
             let c = fa.cmp(fb);
             if a.is_neg { c.reverse() } else { c }
         })
+}
+
+/// A full-width end key for the in-memory wide index: the sentinel classes
+/// park at the extremes exactly as in the `(i64, u32)` rank domain —
+/// unknown below everything, unbounded and unspecified above — while finite
+/// ends carry floor-form `(secs, frac)` at `Integer` width, so deep years
+/// and sub-nanosecond fractions order correctly instead of failing the
+/// domain.
+#[derive(Clone)]
+pub enum EndKey {
+    Below,
+    Finite { secs: Integer, frac: Option<String> },
+    Above,
+}
+
+/// Total order over `EndKey`: classes first (`Below < Finite < Above`),
+/// then `secs`, then lexicographic frac digits — the wide-domain analogue
+/// of the `(secs, nanos)` tuple order.
+pub fn cmp_end_key(a: &EndKey, b: &EndKey) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    use EndKey::*;
+    match (a, b) {
+        (Below, Below) | (Above, Above) => Equal,
+        (Below, _) | (_, Above) => Less,
+        (Above, _) | (_, Below) => Greater,
+        (Finite { secs: s1, frac: f1 }, Finite { secs: s2, frac: f2 }) => {
+            s1.cmp(s2).then_with(|| frac_cmp(f1, f2))
+        }
+    }
+}
+
+/// An end component as a floor-form `EndKey` — the same conversion
+/// `instant_floor` performs, kept at `Integer` width for instants beyond
+/// i128.
+pub fn end_key(c: &Component) -> EndKey {
+    match c {
+        Component::Unknown => EndKey::Below,
+        Component::Unbounded | Component::Unspecified => EndKey::Above,
+        Component::Finite(f) => match &f.frac {
+            Some(d) if f.is_neg => {
+                let len = d.len();
+                let ten = format!("1{}", "0".repeat(len)).parse::<Integer>().unwrap();
+                let comp = format!(
+                    "{:0>width$}",
+                    (&ten - d.parse::<Integer>().unwrap()).to_string(),
+                    width = len
+                );
+                EndKey::Finite {
+                    secs: f.int.clone() - 1,
+                    frac: Some(comp),
+                }
+            }
+            _ => EndKey::Finite {
+                secs: f.int.clone(),
+                frac: f.frac.clone(),
+            },
+        },
+    }
+}
+
+/// A `(secs, nanos)` probe as an `EndKey`: the sentinel probes map onto
+/// their own class — the same collision the rank table has — and `nanos`
+/// becomes canonical frac digits.
+pub fn probe_key(secs: i64, nanos: u32) -> EndKey {
+    if (secs, nanos) == (INTERVAL_UNKNOWN_END, 0) {
+        EndKey::Below
+    } else if (secs, nanos) == (INTERVAL_POS_INF, 0) {
+        EndKey::Above
+    } else {
+        EndKey::Finite {
+            secs: Integer::from(secs),
+            frac: (nanos != 0)
+                .then(|| format!("{:09}", nanos).trim_end_matches('0').to_string()),
+        }
+    }
 }
 
 /// Instant part only (int + fraction). kind/timeshift live later in the
@@ -1257,13 +1406,16 @@ pub fn decode_lexical_entry(bytes: &[u8]) -> Result<LexicalInterval, LexicalInte
         .then(|| period.clone())
     };
     let (cs, ce) = (
-        component_canonical(&start, false),
-        component_canonical(&end, true),
+        component_canonical(&start, false)?,
+        component_canonical(&end, true)?,
     );
     let canonical = if flag == FLAG_POINT {
         // single-component literal: the canonical is the supplied
         // instant/date spelling alone
         cs.clone()
+    } else if flag == FLAG_DECLARED_PERIOD {
+        // three components: bounds plus the stored declared period
+        format!("{}/{}/{}", cs, ce, period)
     } else {
         format!(
             "{}/{}",
@@ -1292,14 +1444,36 @@ pub fn render_lexical_interval(iv: &LexicalInterval) -> String {
         // Single-component spelling (bare date/dateTime as-of point).
         return extend_component(&iv.canonical);
     }
-    let (l, r) = iv.canonical.split_once('/').unwrap_or((&iv.canonical, ""));
     // Single-component spellings are carried by FLAG_POINT entries (handled
     // above); an explicit T/T pair keeps both sides even at equal instants.
     let render_side = |side: &str, c: &Component| match c {
         Component::Finite(_) => extend_component(side),
         _ => c.canonical_str().to_string(),
     };
-    format!("{}/{}", render_side(l, &iv.start), render_side(r, &iv.end))
+    if iv.flag == FLAG_DECLARED_PERIOD {
+        let mut parts = iv.canonical.split('/');
+        return format!(
+            "{}/{}/{}",
+            render_side(parts.next().unwrap_or(""), &iv.start),
+            render_side(parts.next().unwrap_or(""), &iv.end),
+            parts.next().unwrap_or("")
+        );
+    }
+    let (l, r) = iv.canonical.split_once('/').unwrap_or((&iv.canonical, ""));
+    // A duration side renders its supplied period spelling verbatim — it is
+    // not a component, so the bound side it materialised (or a marshal-era
+    // placeholder) must not leak through as a component rendering.
+    let l_out = if iv.flag == FLAG_DURATION_END {
+        l.to_string()
+    } else {
+        render_side(l, &iv.start)
+    };
+    let r_out = if iv.flag == FLAG_START_DURATION {
+        r.to_string()
+    } else {
+        render_side(r, &iv.end)
+    };
+    format!("{}/{}", l_out, r_out)
 }
 
 // -- dictionary probes --------------------------------------------------------
@@ -1336,7 +1510,7 @@ fn lexical_probe_key(secs: i64, nanos: u32, max_tail: bool) -> Bytes {
     assert!(nanos < 1_000_000_000, "nanos must be < 1_000_000_000");
     let secs = posix_to_leap_aware_secs(secs);
     let frac = (nanos != 0).then(|| format!("{nanos:09}"));
-    let (is_neg, int, frac, _) = instant_parts(secs, frac);
+    let (is_neg, int, frac, _) = instant_parts(secs as i128, frac);
     let mut buf = BytesMut::new();
     buf.put_u8(START_FINITE);
     buf.extend(integer_and_fraction_to_storage(
@@ -1543,16 +1717,30 @@ impl IntervalEndIndex {
     /// segment holding lexical-format entries.
     ///
     /// Fails on any finite end not representable at nanos precision: the
-    /// rank table is a fixed `(i64, u32)` domain and clamping would silently
-    /// misorder. Layers containing such ends must use the fallback scan.
+    /// on-disk rank table is a fixed `(i64, u32)` domain and clamping would
+    /// silently misorder, so a single end outside it moves the whole index
+    /// to the wide form — the same rank-table-plus-wavelet shape keyed on
+    /// floor-form `EndKey`s instead.
     pub fn build_lexical(dict: &TypedDict) -> Result<Self, LexicalIntervalError> {
         let mut ends = Vec::new();
+        let mut keys = Vec::new();
+        let mut rankable = true;
         for id in dict.lexical_interval_segment().unwrap_or(0..0) {
             let entry = dict
                 .entry(id as usize)
                 .ok_or(LexicalIntervalError::MalformedEntry)?;
             let iv = decode_lexical_entry(&entry.to_bytes())?;
-            ends.push(end_rank_key(&iv.end)?);
+            keys.push(end_key(&iv.end));
+            if rankable {
+                match end_rank_key(&iv.end) {
+                    Ok(k) => ends.push(k),
+                    Err(LexicalIntervalError::UnrepresentableEnd(_)) => rankable = false,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        if !rankable {
+            return Ok(IntervalEndIndex::wide(keys));
         }
 
         let mut distinct = ends.clone();
@@ -1823,7 +2011,9 @@ fn legacy_component(
         offset_minutes,
         canonical: String::new(),
     };
-    f.canonical = reconstruct_component_canonical(&f, is_end);
+    // i64-domain marshal inputs always reconstruct — invariant, not user data
+    f.canonical = reconstruct_component_canonical(&f, is_end)
+        .expect("legacy instant is always inside the render domain");
     Component::Finite(f)
 }
 
@@ -1839,18 +2029,13 @@ pub fn legacy_interval_to_lexical(iv: &DateTimeInterval) -> LexicalInterval {
     );
     let end = legacy_component(iv.end_seconds, iv.end_nanos, iv.end_type, iv.end_tz, true);
     let period = duration_to_period(&iv.duration);
+    let cc = |c: &Component, e: bool| {
+        component_canonical(c, e).expect("legacy instant is always inside the render domain")
+    };
     let canonical = match iv.flag {
-        INTERVAL_FLAG_DURATION_END => {
-            format!("{}/{}", period, component_canonical(&end, true))
-        }
-        INTERVAL_FLAG_START_DURATION => {
-            format!("{}/{}", component_canonical(&start, false), period)
-        }
-        _ => format!(
-            "{}/{}",
-            component_canonical(&start, false),
-            component_canonical(&end, true)
-        ),
+        INTERVAL_FLAG_DURATION_END => format!("{}/{}", period, cc(&end, true)),
+        INTERVAL_FLAG_START_DURATION => format!("{}/{}", cc(&start, false), period),
+        _ => format!("{}/{}", cc(&start, false), cc(&end, true)),
     };
     LexicalInterval {
         start,
@@ -1875,19 +2060,14 @@ pub fn lexical_interval_from_parts(
 ) -> LexicalInterval {
     let s = legacy_component(start.0, start.1, start.2, start.3, false);
     let e = legacy_component(end.0, end.1, end.2, end.3, true);
+    let cc = |c: &Component, e: bool| {
+        component_canonical(c, e).expect("marshal instant is always inside the render domain")
+    };
     let canonical = match flag {
-        FLAG_POINT => component_canonical(&s, false),
-        INTERVAL_FLAG_DURATION_END => {
-            format!("{}/{}", period, component_canonical(&e, true))
-        }
-        INTERVAL_FLAG_START_DURATION => {
-            format!("{}/{}", component_canonical(&s, false), period)
-        }
-        _ => format!(
-            "{}/{}",
-            component_canonical(&s, false),
-            component_canonical(&e, true)
-        ),
+        FLAG_POINT => cc(&s, false),
+        INTERVAL_FLAG_DURATION_END => format!("{}/{}", period, cc(&e, true)),
+        INTERVAL_FLAG_START_DURATION => format!("{}/{}", cc(&s, false), period),
+        _ => format!("{}/{}", cc(&s, false), cc(&e, true)),
     };
     LexicalInterval {
         start: s,
@@ -2003,21 +2183,28 @@ impl TypedDict {
 /// Build the interval end index over a dictionary whose DateTimeInterval
 /// segment holds lexical entries, writing the four files: the stride-2 end
 /// rank table (`ends`), and the wavelet tree's `bits`, `blocks`, `sblocks`.
+///
+/// Returns `false` when an end lies outside the `(i64, u32)` rank domain —
+/// no files are touched, so the layer opens with the in-memory wide index.
 pub async fn build_interval_end_index_lexical<F: 'static + FileLoad + FileStore>(
     dict: &TypedDict,
     destination_ends: F,
     destination_bits: F,
     destination_blocks: F,
     destination_sblocks: F,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let mut ends = Vec::new();
     for id in dict.lexical_interval_segment().unwrap_or(0..0) {
         let entry = dict.entry(id as usize).expect("interval id in segment");
         let iv = decode_lexical_entry(&entry.to_bytes())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        ends.push(
-            end_rank_key(&iv.end).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
-        );
+        match end_rank_key(&iv.end) {
+            Ok(k) => ends.push(k),
+            // End outside the rank domain — write nothing. Layer-open sees
+            // no index files and builds the in-memory wide index instead.
+            Err(LexicalIntervalError::UnrepresentableEnd(_)) => return Ok(false),
+            Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
+        }
     }
 
     let mut distinct = ends.clone();
@@ -2042,7 +2229,9 @@ pub async fn build_interval_end_index_lexical<F: 'static + FileLoad + FileStore>
         destination_blocks,
         destination_sblocks,
     )
-    .await
+    .await?;
+
+    Ok(true)
 }
 
 // ---- Allen interval relations (literal-level evaluator) ----
@@ -2349,6 +2538,18 @@ mod tests {
         )
     }
 
+    /// The duration side of a `T/P` / `P/T` literal is the period spelling,
+    /// not a component — render must pass it through verbatim rather than
+    /// rendering the materialised bound (or `..` for marshal-built entries
+    /// whose other bound was never finite).
+    #[test]
+    fn render_duration_side_is_verbatim() {
+        for s in ["2025-01-01/P37W", "P90D/2025-03-31", "2025-01-20/PT0.1S"] {
+            let iv = parse_lexical_interval(s).unwrap();
+            assert_eq!(render_lexical_interval(&iv), s);
+        }
+    }
+
     fn build_dict(mut entries: Vec<TypedDictEntry>) -> TypedDict {
         entries.sort();
         let mut b = TypedDictBufBuilder::new(
@@ -2497,15 +2698,51 @@ mod tests {
         assert_eq!(ge, vec![0, 1, 5, 6]);
     }
 
+    /// Ends outside the `(i64, u32)` rank domain build the wide index:
+    /// floor-form `EndKey`s probed with the same NULL/plus-infinity
+    /// semantics as the rank probes.
     #[test]
-    fn end_index_rejects_subnano_end() {
-        let dict = build_dict(vec![iv_entry(
-            "2025-01-01T00:00:00.123456789012Z/2025-01-01T00:00:01.999999999999Z",
-        )]);
-        assert!(matches!(
-            IntervalEndIndex::build_lexical(&dict),
-            Err(LexicalIntervalError::UnrepresentableEnd(_))
-        ));
+    fn end_index_wide_ranks_unrepresentable_ends() {
+        // lexical sort puts finite ends first (by instant), then unknown,
+        // unspecified, unbounded.
+        let dict = build_dict(vec![
+            iv_entry("-15000000000-01-01/-13800000000-01-01"), // 0: deep-past end
+            iv_entry("2025-01-01/2025-06-01T00:00:00.0000000000001Z"), // 1: sub-nanos
+            iv_entry("2025-01-01/2025-06-01T00:00:00.5Z"),             // 2: nanos
+            iv_entry("2025-01-01/"),                                   // 3: unknown end
+            iv_entry("2025-01-01/X*"),                                 // 4: unspecified
+            iv_entry("2025-01-01/.."),                                 // 5: unbounded
+        ]);
+        let idx = IntervalEndIndex::build_lexical(&dict).unwrap();
+        assert_eq!(idx.len(), 6);
+        let pos = 0..6;
+        // probe instants are leap-aware, the domain the rank keys share
+        let probe = posix_to_leap_aware_secs(1748736000); // 2025-06-01T00:00:00Z
+        // 2025-06-01T00:00:00.3Z — deep past and the sub-nanos end are at or
+        // below; the .5 end, unknown, unspecified and unbounded are not.
+        let mut le = idx.positions_end_le(pos.clone(), probe, 300_000_000);
+        le.sort();
+        assert_eq!(le, vec![0, 1]);
+        let mut lt = idx.positions_end_lt(pos.clone(), probe, 300_000_000);
+        lt.sort();
+        assert_eq!(lt, vec![0, 1]);
+        // ge/gt reach the .5 end and both open classes, never unknown.
+        let mut ge = idx.positions_end_ge(pos.clone(), probe, 300_000_000);
+        ge.sort();
+        assert_eq!(ge, vec![2, 4, 5]);
+        let mut gt = idx.positions_end_gt(pos.clone(), probe, 300_000_000);
+        gt.sort();
+        assert_eq!(gt, vec![2, 4, 5]);
+        let mut eq = idx.positions_end_eq(pos.clone(), probe, 500_000_000);
+        eq.sort();
+        assert_eq!(eq, vec![2]);
+        let mut range = idx.positions_end_range(
+            pos.clone(),
+            (probe, 100_000_000),
+            (probe, 900_000_000),
+        );
+        range.sort();
+        assert_eq!(range, vec![2]);
     }
 
     // -- canonicalisation / packing ------------------------------------------
@@ -2986,7 +3223,7 @@ mod tests {
         // end classes: finite < unknown < unspecified < unbounded; finite
         // ends order by instant first. Same start throughout.
         let expected = [
-            "2025-01-01/1969-12-31",
+            "2025-01-01/2025-01-02",
             "2025-01-01/2025-02-01",
             "2025-01-01/",
             "2025-01-01/X*",
@@ -3184,7 +3421,6 @@ mod tests {
         "2025-03-15T10:30:00.500000000000000001Z/2030-01-01",
         "2025-03-15T10:30:00.999999999999999999Z/2030-01-01",
         "2025-03-15T10:30:01Z/2025-03-15T12:30:00Z",
-        "-P1D/2025-03-15", // negative duration: start = Mar 17
     ];
 
     /// Roundtrip: every accepted spelling encodes, decodes and renders back
@@ -3241,6 +3477,33 @@ mod tests {
         assert!(entry("2025-03-15T10:30:00/2030-01-01") < zero);
     }
 
+    /// A zoned date `D+off` is the whole calendar day *in that zone*
+    /// (XBRL 2.1 `xbrli:instant` allows it). Kind stays DATE, the offset
+    /// applies to the bound instants, and the spelling round-trips.
+    #[test]
+    fn zoned_date_is_the_day_in_that_zone() {
+        let iv = parse_lexical_interval("2003-12-31+05:00").unwrap();
+        let Component::Finite(start) = &iv.start else { panic!("date") };
+        assert_eq!(start.kind, KIND_DATE);
+        assert_eq!(start.tz_class, TZ_POS);
+        assert_eq!(start.offset_minutes, 300);
+        // bounds == the UTC pair covering 2003-12-31 in +05:00
+        let utc = parse_lexical_interval("2003-12-30T19:00:00Z/2003-12-31T19:00:00Z").unwrap();
+        assert_eq!(
+            cmp_interval_bounds(&iv, &utc),
+            std::cmp::Ordering::Equal
+        );
+        // spelling preserved
+        assert_eq!(
+            render_lexical_interval(&decode_lexical_entry(&entry("2003-12-31+05:00")).unwrap()),
+            "2003-12-31+05:00"
+        );
+        // end position: bare [D+off] == the same-day pair [D+off/D+off]
+        // (the inclusive end bumps to the next day internally)
+        let pair = parse_lexical_interval("2003-12-31+05:00/2003-12-31+05:00").unwrap();
+        assert_eq!(cmp_interval_bounds(&iv, &pair), std::cmp::Ordering::Equal);
+    }
+
     /// Negative instants keep precision too: the complement encoding
     /// `(10^len − f) mod 10^len` preserves digit count, and an all-zero
     /// fraction on a negative value stays integral (`.00` = −1.00 → int −1).
@@ -3268,8 +3531,8 @@ mod tests {
     }
 
     /// Supplied duration fractions keep their precision in the period
-    /// spelling, but the anchor is computed at nanos — a finer fraction
-    /// must fail loudly rather than truncate.
+    /// spelling, and the computed bound carries the same digits — up to the
+    /// 44-digit precision boundary. A finer fraction fails loudly.
     #[test]
     fn duration_fraction_precision() {
         // supplied spelling survives verbatim
@@ -3280,43 +3543,124 @@ mod tests {
                 v
             );
         }
-        // 9 digits is the nanos floor: accepted, computed end carries it
+        // 9 digits: the bound keeps them
         let e = entry("2025-01-01T00:00:00Z/PT0.123456789S");
         assert_eq!(
             render_lexical_interval(&decode_lexical_entry(&e).unwrap()),
             "2025-01-01T00:00:00Z/PT0.123456789S"
         );
-        // 10 digits is unrepresentable — parse must fail, not truncate
+        // 10+ digits: now inside the precision domain — the bound carries
+        // the full fraction, no truncation
+        let e = entry("2025-01-01T00:00:00Z/PT0.5000000001S");
+        let d = decode_lexical_entry(&e).unwrap();
+        assert_eq!(
+            render_lexical_interval(&d),
+            "2025-01-01T00:00:00Z/PT0.5000000001S"
+        );
+        // the computed bound IS the exact instant — equal to the
+        // point on the same instant
+        let shifted =
+            parse_lexical_interval("2025-01-01T00:00:00Z/PT0.5000000001S").unwrap();
+        let point = parse_lexical_interval("2025-01-01T00:00:00.5000000001Z").unwrap();
+        let (Component::Finite(se), Component::Finite(ps)) = (&shifted.end, &point.start)
+        else {
+            panic!("finite components")
+        };
+        assert_eq!(secs_frac(se), secs_frac(ps));
+        // 49 digits is the precision boundary: accepted verbatim
+        let f49 = format!("2025-01-01T00:00:00Z/PT0.{}S", "1".repeat(49));
+        let e = entry(&f49);
+        assert_eq!(render_lexical_interval(&decode_lexical_entry(&e).unwrap()), f49);
+        // 50 digits is unrepresentable — parse must fail, not truncate
         assert!(matches!(
-            parse_lexical_interval("2025-01-01/PT0.5000000001S"),
+            parse_lexical_interval(&format!(
+                "2025-01-01/PT0.{}S",
+                "1".repeat(50)
+            )),
             Err(LexicalIntervalError::Parse(
-                crate::tfc::interval::IntervalParseError::DurationTooPrecise(_)
+                crate::tfc::interval::IntervalParseError::InvalidDuration(_)
             ))
         ));
     }
 
-    /// Accepted-but-normalised forms render in extended canonical spelling.
+    /// Full `xsd:duration` resolution in interval durations — no u8 caps,
+    /// no f64 seconds, week folds ×7 for arithmetic, deep-time anchors.
+    /// The computed bound is compared as an instant against the point on
+    /// the same instant.
     #[test]
-    fn basic_forms_render_extended() {
-        for (input, rendered) in [
-            (
-                "2025-03-15T103000Z/2030-01-01",
-                "2025-03-15T10:30:00Z/2030-01-01",
-            ),
-            (
-                "2025-03-15T10:30:00+0530/2030-01-01",
-                "2025-03-15T10:30:00+05:30/2030-01-01",
-            ),
-            (
-                "2025-03-15T10:30:00-0000/2030-01-01",
-                "2025-03-15T10:30:00-00:00/2030-01-01",
-            ),
+    fn precision_durations() {
+        let end_eq = |iv: &str, point: &str| {
+            let a = parse_lexical_interval(iv).unwrap();
+            let b = parse_lexical_interval(point).unwrap();
+            let (Component::Finite(e), Component::Finite(p)) = (&a.end, &b.start) else {
+                panic!("finite components")
+            };
+            assert_eq!(secs_frac(e), secs_frac(p), "{iv} end vs {point}");
+        };
+        let start_eq = |iv: &str, point: &str| {
+            let a = parse_lexical_interval(iv).unwrap();
+            let b = parse_lexical_interval(point).unwrap();
+            let (Component::Finite(s), Component::Finite(p)) = (&a.start, &b.start) else {
+                panic!("finite components")
+            };
+            assert_eq!(secs_frac(s), secs_frac(p), "{iv} start vs {point}");
+        };
+        // components beyond the old u8 cap
+        end_eq("2025-01-01/P300D", "2025-10-28");
+        end_eq("2025-01-01T00:00:00Z/PT300H", "2025-01-13T12:00:00Z");
+        end_eq("2025-01-01/P1Y", "2026-01-01");
+        end_eq("100000-01-01/P1D", "100000-01-02"); // wide year
+        // week folds ×7 for arithmetic (spelling stays in the period)
+        end_eq("2025-01-01/P37W", "2025-09-17");
+        // month-end clamp: Jan 31 + 1M → Feb 28
+        end_eq("2025-01-31/P1M", "2025-02-28");
+        // leap-year clamp: Mar 31 - 1M → Feb 29 (2024 is a leap year)
+        start_eq("P1M/2024-03-31T00:00:00Z", "2024-02-29T00:00:00Z");
+        // and Mar 31 + 1M clamps to Apr 30
+        end_eq("2024-03-31T00:00:00Z/P1M", "2024-04-30T00:00:00Z");
+        // carry across the second boundary: .9 + .5 → +1s .4
+        end_eq(
+            "2025-01-01T00:00:00.9Z/PT0.5S",
+            "2025-01-01T00:00:01.4Z",
+        );
+        // borrow: anchored end minus duration crosses the second boundary
+        start_eq(
+            "PT0.5S/2025-01-01T00:00:00.3Z",
+            "2024-12-31T23:59:59.8Z",
+        );
+        // deep-time anchor — i128 seconds, no i64 panic
+        end_eq("-300000-06-15/P1D", "-300000-06-16");
+        // a negative duration is not an interval literal — the interval
+        // grammar's duration production admits no sign (the sign is legal
+        // only in a standalone xsd:duration)
+        assert!(matches!(
+            parse_lexical_interval("2025-01-15/-P2D"),
+            Err(LexicalIntervalError::Parse(
+                crate::tfc::interval::IntervalParseError::InvalidDuration(_)
+            ))
+        ));
+        // components parse to i128 but the shift multiplies overflow — must
+        // be a clean parse error, not a panic (checked arithmetic only)
+        for s in [
+            "2025-01-01/P30000000000000000000000000000000000000Y", // * 12
+            "2025-01-01/P3000000000000000000000000000000000D",   // * 86400
+            "P30000000000000000000000000000000000000Y/2025-01-01",
+            "2025-01-01/PT300000000000000000000000000000000000H", // * 3600
         ] {
-            assert_eq!(
-                render_lexical_interval(&decode_lexical_entry(&entry(input)).unwrap()),
-                rendered
-            );
+            assert!(parse_lexical_interval(s).is_err(), "{s} must error, not panic");
         }
+        // an explicit inverted pair is an empty interval — rejected, loudly.
+        // Equal bounds are a legal zero-length pair.
+        assert!(matches!(
+            parse_lexical_interval("2025-04-01/2025-01-01"),
+            Err(LexicalIntervalError::Inverted(_))
+        ));
+        assert!(matches!(
+            parse_lexical_interval("2025-01-01T00:00:01Z/2025-01-01T00:00:00.9Z"),
+            Err(LexicalIntervalError::Inverted(_))
+        ));
+        assert!(parse_lexical_interval("2025-01-01/2025-01-01").is_ok());
+        assert!(parse_lexical_interval("2025-01-01T00:00:00.5Z/2025-01-01T00:00:00.50Z").is_ok());
     }
 
     /// Spellings outside the grammar are rejected, loudly.
@@ -3324,6 +3668,9 @@ mod tests {
     fn rejected_spellings() {
         for bad in [
             "20250315/2025-03-16",             // basic date — extended required
+            "2025-03-15T103000Z/2030-01-01",   // basic time — colons required
+            "2025-03-15T10:30:00+0530/2030-01-01", // basic zone — colon required
+            "2025-03-15T10:30:00-0000/2030-01-01", // basic -0000
             "2025-03-15T10:30/2030-01-01",     // HH:MM without seconds
             "P1D/P2D",                         // two durations
             "../P1D",                          // duration anchored on a special
@@ -3342,6 +3689,99 @@ mod tests {
                 "{bad} must be rejected"
             );
         }
+    }
+
+    // -- declared period `T/T/P` ---------------------------------------------
+    //
+    // The third component is a supplied duration that must be exactly the
+    // interval's materialised span: `start + declared == end` on the stored
+    // bounds — a date end is its inclusive bound, a dateTime end its exact
+    // instant. Aligned declarations are part of the literal; misaligned ones
+    // are rejected rather than silently re-derived.
+
+    #[test]
+    fn declared_period_aligned() {
+        // leap Q1 is 91 days; non-leap Q1 is 90 — the declaration tracks
+        // the materialised bounds, so the same spelling means both.
+        for s in [
+            "2024-01-01/2024-03-31/P91D",
+            "2024-01-01/2024-03-31/P3M", // the same span, calendar units
+            "2025-01-01/2025-03-31/P90D",
+            "2024-01-01T00:00:00Z/2024-04-01T00:00:00Z/P91D",
+            "2025-01-01/2025-01-01/P1D", // a single inclusive day
+            "2025-01-01T00:00:00/2025-01-01T00:00:00/PT0S", // zero-length
+            "2025-01-01T00:00:00.1Z/2025-01-01T00:00:00.2Z/PT0.1S",
+            "-13800000000-01-01/-13800000000-12-31/P1Y",
+        ] {
+            let iv = parse_lexical_interval(s).unwrap_or_else(|e| panic!("{s}: {e}"));
+            assert_eq!(iv.flag, FLAG_DECLARED_PERIOD, "{s}");
+            // the literal renders back with its declared third component
+            let decoded = decode_lexical_entry(&encode_lexical_interval(&iv)).unwrap();
+            assert_eq!(decoded.flag, FLAG_DECLARED_PERIOD, "{s}");
+            assert_eq!(s, render_lexical_interval(&decoded), "{s}");
+        }
+    }
+
+    #[test]
+    fn declared_period_rejects_misaligned() {
+        for (s, want) in [
+            ("2025-01-01/2025-03-31/P91D", "90-day span declared 91"),
+            ("2024-01-01/2024-03-31/P90D", "91-day span declared 90"),
+            (
+                "2025-01-01T00:00:00Z/2025-04-01T00:00:00Z/P91D",
+                "90-day span declared 91",
+            ),
+            ("2025-01-01/2025-03-31/P2M", "calendar mismatch"),
+            ("2025-01-01T00:00:00.1Z/2025-01-01T00:00:00.2Z/PT0.2S", "frac"),
+        ] {
+            assert!(
+                matches!(
+                    parse_lexical_interval(s),
+                    Err(LexicalIntervalError::PeriodMismatch(_))
+                ),
+                "{s} ({want}) must be a PeriodMismatch"
+            );
+        }
+        // specials give no finite pair to align against
+        for s in ["../2025-03-31/P1D", "2025-01-01/../P1D", "X*/2025-03-31/P1D"] {
+            assert!(
+                matches!(
+                    parse_lexical_interval(s),
+                    Err(LexicalIntervalError::Parse(
+                        IntervalParseError::UnboundedWithDuration(_)
+                    ))
+                ),
+                "{s} must be UnboundedWithDuration"
+            );
+        }
+        // inverted bounds report Inverted, not a misalignment
+        assert!(matches!(
+            parse_lexical_interval("2025-04-01/2025-01-01/P1D"),
+            Err(LexicalIntervalError::Inverted(_))
+        ));
+        // malformed thirds — empty, non-duration, negative duration
+        for s in [
+            "2025-01-01/2025-03-31/",
+            "2025-01-01/2025-03-31/2025-01-01",
+            "2025-01-01/2025-03-31/-P90D",
+            "P1D/2025-03-31/P1D",
+        ] {
+            assert!(parse_lexical_interval(s).is_err(), "{s} must be rejected");
+        }
+    }
+
+    #[test]
+    fn declared_period_distinct_literal_equal_bounds() {
+        // `T/T/P` and `T/T` with equal bounds are the same interval but
+        // distinct literals — the declared period rides in the entry's
+        // period field, the flag keeps the forms apart.
+        let declared = parse_lexical_interval("2024-01-01/2024-03-31/P91D").unwrap();
+        let pair = parse_lexical_interval("2024-01-01/2024-03-31").unwrap();
+        assert_eq!(
+            cmp_interval_bounds(&declared, &pair),
+            std::cmp::Ordering::Equal
+        );
+        assert_ne!(entry("2024-01-01/2024-03-31/P91D"), entry("2024-01-01/2024-03-31"));
     }
 
     // -- derived period --------------------------------------------------------
@@ -3632,7 +4072,8 @@ mod tests {
                 ),
                 format!("P{}W/2025-06-30", i % 4 + 1),
                 format!(
-                    "1999-12-31T23:{:02}:59-14:00/2000-01-01T00:00:01+14:00",
+                    "1999-12-31T23:{:02}:59-14:00/2000-01-02T23:{:02}:59+14:00",
+                    i % 60,
                     i % 60
                 ),
                 format!("2025-{:02}-{:02}/X*", i % 12 + 1, day),
@@ -4065,5 +4506,20 @@ mod tests {
             &duration_parts_to_period(1, 0, 0, 0, 5_000_000_000_000, 0, 0, "0"),
         );
         assert!(big.canonical.ends_with("/P5000000000000D"));
+    }
+}
+
+#[cfg(test)]
+mod zzz_probe {
+    use super::*;
+    #[test]
+    fn dbg_stripped_and_materialise() {
+        // does parse accept the stripped canonical component spelling?
+        for s in ["20250120/PT0.1S", "PT0.1S/20251013", "20250120/P300D"] {
+            match parse_lexical_interval(s) {
+                Ok(iv) => eprintln!("{s} ok flag={} canon={:?} render={:?}", iv.flag, iv.canonical, render_lexical_interval(&iv)),
+                Err(e) => eprintln!("{s} ERR {e:?}"),
+            }
+        }
     }
 }
